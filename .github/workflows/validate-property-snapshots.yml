@@ -16,7 +16,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           repository: Afloat16/manifold
-          ref: 847a82925fb9f1dc260fb483bc7427d4f15d8133
+          ref: 0d24c5988dfe0105cce19e56d75ec1eff5e6213c
           persist-credentials: false
       - run: |
           python3 -m venv .format-env
@@ -34,14 +34,14 @@ jobs:
       - uses: actions/checkout@v7
         with:
           repository: Afloat16/manifold
-          ref: 847a82925fb9f1dc260fb483bc7427d4f15d8133
+          ref: 0d24c5988dfe0105cce19e56d75ec1eff5e6213c
           fetch-depth: 2
           persist-credentials: false
       - name: Prepare pinned sources
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = 847a82925fb9f1dc260fb483bc7427d4f15d8133
+          test "$(git rev-parse HEAD)" = 0d24c5988dfe0105cce19e56d75ec1eff5e6213c
           python3 -m venv .validation-env
           .validation-env/bin/python -m pip install cmake==4.4.5 ninja==1.13.0
           echo "$GITHUB_WORKSPACE/.validation-env/bin" >> "$GITHUB_PATH"
@@ -279,7 +279,7 @@ jobs:
               result["allocation_change_percent"] = 100 * (result["fixed_bytes"] / result["base_bytes"] - 1)
               result["time_change_percent"] = 100 * (result["fixed_median_us"] / result["base_median_us"] - 1)
               summary.append(result)
-          report = {"base": "08723c1b9f72225d1b63037f8a95e48387661b14", "candidate": "847a82925fb9f1dc260fb483bc7427d4f15d8133",
+          report = {"base": "08723c1b9f72225d1b63037f8a95e48387661b14", "candidate": "0d24c5988dfe0105cce19e56d75ec1eff5e6213c",
                     "platform": platform.platform(), "affinity_cpu": cpu,
                     "allocation_scope": "requested bytes from malloc/calloc/realloc during one public call; not peak live memory or RSS",
                     "results": summary}
@@ -307,7 +307,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: property-snapshots-847a829
+          name: property-snapshots-0d24c59
           path: validation-results/
           if-no-files-found: warn
           retention-days: 14
