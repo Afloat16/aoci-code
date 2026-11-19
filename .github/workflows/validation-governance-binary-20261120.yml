@@ -1,0 +1,32 @@
+name: Build exact AOCI governance binary
+on:
+  push:
+    branches: [validation/aoci-governance-binary-20261120]
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: aoci-spec/aoci-code
+          ref: f6368bc0a44048de5c75ccd11a557d85767d0614
+          persist-credentials: false
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26.11'
+          cache: false
+      - name: Build official binary from exact source
+        run: |
+          test "$(git rev-parse HEAD)" = f6368bc0a44048de5c75ccd11a557d85767d0614
+          make build BUILD_BIN=build/aoci-governance
+          sha256sum build/aoci-governance
+          git diff --exit-code
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aoci-governance-linux-amd64-f6368bc0
+          path: build/aoci-governance
+          retention-days: 3
+          if-no-files-found: error
