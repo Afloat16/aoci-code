@@ -1,0 +1,104 @@
+name: postgresql-index-direction-6999-gates
+
+on:
+  push:
+    branches: [validation/postgresql-index-direction-6999-gates-20261119]
+
+permissions:
+  contents: read
+
+jobs:
+  fast:
+    if: github.repository == 'Afloat16/aoci-code'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: c4c46f5c6465260928193e9f25d22425bf76c493
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version-file: go.mod
+          cache: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version: 22
+      - name: Verify exact source identity
+        run: test "$(git rev-parse HEAD)" = c4c46f5c6465260928193e9f25d22425bf76c493
+      - name: Run ordinary contribution gate
+        run: make fast
+      - name: Check source bytes
+        if: always()
+        run: git diff --exit-code
+
+  verify:
+    if: github.repository == 'Afloat16/aoci-code'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: c4c46f5c6465260928193e9f25d22425bf76c493
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version-file: go.mod
+          cache: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version: 22
+      - name: Verify exact source identity
+        run: test "$(git rev-parse HEAD)" = c4c46f5c6465260928193e9f25d22425bf76c493
+      - name: Install the repository's pinned analysis tools
+        run: |
+          go install honnef.co/go/tools/cmd/staticcheck@v0.7.0
+          go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
+          go install github.com/google/go-licenses@v1.6.0
+      - name: Run complete deterministic closure
+        run: make verify
+      - name: Check aligned index
+        if: always()
+        run: bash scripts/check-index-quality.sh build/aoci
+      - name: Check source bytes
+        if: always()
+        run: git diff --exit-code
+
+  native-postgresql:
+    if: github.repository == 'Afloat16/aoci-code'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: c4c46f5c6465260928193e9f25d22425bf76c493
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Verify source identity
+        run: test "$(git rev-parse HEAD)" = c4c46f5c6465260928193e9f25d22425bf76c493
+      - name: Start isolated PostgreSQL
+        run: |
+          password="aoci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          echo "::add-mask::${password}"
+          echo "AOCI_TEST_POSTGRES_ADMIN_PASSWORD=${password}" >> "$GITHUB_ENV"
+          echo 'AOCI_TEST_POSTGRES_ADMIN_USER=postgres' >> "$GITHUB_ENV"
+          echo 'AOCI_TEST_POSTGRES_ADMIN_DATABASE=postgres' >> "$GITHUB_ENV"
+          docker run -d --name "aoci-pg-${GITHUB_RUN_ID}" -p 127.0.0.1::5432 -e POSTGRES_PASSWORD="${password}" postgres:18 >/dev/null
+          port="$(docker port "aoci-pg-${GITHUB_RUN_ID}" 5432/tcp | head -n1 | sed 's/.*://')"
+          test -n "$port"
+          echo "AOCI_TEST_POSTGRES_ADMIN_ADDR=127.0.0.1:${port}" >> "$GITHUB_ENV"
+          for attempt in $(seq 1 30); do docker exec "aoci-pg-${GITHUB_RUN_ID}" pg_isready -U postgres >/dev/null 2>&1 && break; sleep 1; done
+          docker exec "aoci-pg-${GITHUB_RUN_ID}" pg_isready -U postgres >/dev/null
+      - name: Run the complete native PostgreSQL contract
+        run: |
+          set -euo pipefail
+          go test -v -tags=integration -count=1 -run TestPostgreSQLRealCatalogCollectionAndDrift ./internal/dbevidence | tee "$RUNNER_TEMP/native-postgresql.log"
+          grep -q -- '--- PASS: TestPostgreSQLRealCatalogCollectionAndDriftIndexDirections' "$RUNNER_TEMP/native-postgresql.log"
+          if grep -q -- '--- SKIP:' "$RUNNER_TEMP/native-postgresql.log"; then exit 1; fi
+          git diff --exit-code
+      - name: Stop isolated PostgreSQL
+        if: always()
+        run: docker rm -f "aoci-pg-${GITHUB_RUN_ID}" >/dev/null 2>&1 || true
