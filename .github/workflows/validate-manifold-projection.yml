@@ -11,7 +11,10 @@ concurrency:
 jobs:
   native:
     if: github.repository == 'Afloat16/aoci-code' && github.ref == 'refs/heads/validation/manifold-projection-20261119'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    env:
+      CC: gcc-14
+      CXX: g++-14
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
@@ -35,7 +38,7 @@ jobs:
           echo "$GITHUB_WORKSPACE/.validation-env/bin" >> "$GITHUB_PATH"
           mkdir -p validation-results
           .validation-env/bin/python -m pip freeze > validation-results/build-tools.txt
-          c++ --version > validation-results/compiler.txt
+          "$CXX" --version > validation-results/compiler.txt
           git worktree add --detach ../projection-base dd22417913d8161d92e466bd71987fe039498987
       - name: Build and test the exact baseline
         shell: bash
@@ -226,7 +229,7 @@ jobs:
               print(row["name"], row["base_median_us"], row["fixed_median_us"], row["change_percent"])
           
           SOURCE
-          c++ -std=c++17 -O3 validation-results/probe.cpp -Iinclude -Ibuild-fixed/include -Lbuild-fixed/src -Wl,-rpath,"$GITHUB_WORKSPACE/build-fixed/src" -lmanifold -o validation-results/probe
+          "$CXX" -std=c++17 -O3 validation-results/probe.cpp -Iinclude -Ibuild-fixed/include -Lbuild-fixed/src -Wl,-rpath,"$GITHUB_WORKSPACE/build-fixed/src" -lmanifold -o validation-results/probe
       - name: Measure five fresh alternating process pairs
         shell: bash
         run: |
