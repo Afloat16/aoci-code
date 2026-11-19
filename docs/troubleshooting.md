@@ -160,6 +160,59 @@ path-based deletion fix in commit `6b4f0cc` addresses the original refusal
 (#117). Use an official release containing that fix when available; manually
 deleting lines from a formal Volume can instead create this Baseline drift.
 
+## After merging two branches that both maintained the index
+
+Both branches wrote Entries, so `.aoci/baseline.json` conflicts and often a
+Volume does too. Keep one side's index whole and let Maintain re-issue the
+rest; never resolve the two files by hand or take them from different sides.
+
+While the merge is open, take the Root, the Meta, every Volume, and the
+Baseline from the same side (`HEAD` is the branch you are on, `MERGE_HEAD` the
+one being merged):
+
+```bash
+git checkout MERGE_HEAD -- aoci.txt aoci.meta.txt aoci.code.txt .aoci/baseline.json
+```
+
+Then run `aoci_maintain`. It returns every source the kept side's Entries do
+not describe (what the other branch changed or added), and the batch aligns
+the repository. Add `aoci.database.txt` when the Root enables a Database
+Volume.
+
+If only one of the files was taken, Maintain stops with
+`next_action=restore_formal_assets_from_one_commit`, the
+`code_volume_unbaselined` finding carries `cause=changed_after_baseline`, and
+`next_commands` holds that same `git checkout {commit} -- ...` with the exact
+paths of this repository; fill `{commit}` and run it. After the merge was
+committed, `{commit}` is a parent of the merge commit (`HEAD^1` or `HEAD^2`).
+The Guide's stop carries the same command. It is offered only while it is
+the stop that comes first: a pending receipt under `.aoci/transactions` is
+closed before anything is restored, and a pending Scope Change waits for the
+restore.
+
+If git answers `pathspec ... did not match`, the commit you named does not
+have one of the listed files (only the other branch enabled a Database
+Volume, for example). Nothing was written; name the other side.
+
+The other way round, the commit you named may enable a Volume the working
+tree's Root did not, so the command did not list it: the checkout succeeds,
+the restored Root declares that Volume, and Maintain answers
+`declared_volume_missing` naming the file. Check it out from the same commit
+(`git checkout MERGE_HEAD -- aoci.database.txt`) and run Maintain again.
+
+When both branches also accepted new Database Evidence,
+`.aoci/database-baseline.json` conflicts too and is not part of the restore.
+Resolve that file to either side's whole file (`git checkout HEAD --
+.aoci/database-baseline.json`, or `MERGE_HEAD`); while it holds conflict
+markers the evidence commands Maintain returns cannot bind a snapshot. The
+merged database may match neither branch, and it does not need to: the
+`database snapshot` and `database baseline accept` Maintain names next
+rebind the Evidence to the database as it is now, and Maintain then returns
+the tables whose Entries no longer describe it.
+
+A Volume left holding conflict markers may not load at all. Maintain then
+answers the load failure naming the asset; the same checkout repairs it.
+
 ## A Volume shows as `observed_removed`, and nothing can acknowledge it
 
 Through rc22 a Managed Scope rule could match a formal asset. A rule that gave
