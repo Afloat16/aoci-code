@@ -1,0 +1,65 @@
+name: Validate Recent ledger refresh
+on:
+  push:
+    branches: [validation/recent-ledger-refresh-20261120]
+permissions:
+  contents: read
+jobs:
+  fast:
+    if: github.repository == 'Afloat16/aoci-code'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: Afloat16/aoci-code
+          ref: ebee8dd591947a8fa678b2711332474a3e3745e8
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version: '1.26.11'
+          cache: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version: '22'
+      - name: Verify exact source and ledger regressions
+        run: |
+          test "$(git rev-parse HEAD)" = ebee8dd591947a8fa678b2711332474a3e3745e8
+          go test -v -count=1 ./internal/ledger
+          go test -count=1 -run '^$' -bench '^BenchmarkRecentLimitedHistory$' -benchmem -benchtime=1x ./internal/ledger
+      - name: Required fast gate
+        run: make fast
+      - name: Formal index quality on committed source
+        run: |
+          make build
+          bash scripts/check-index-quality.sh build/aoci
+          git diff --exit-code
+  verify:
+    if: github.repository == 'Afloat16/aoci-code'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: Afloat16/aoci-code
+          ref: ebee8dd591947a8fa678b2711332474a3e3745e8
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version: '1.26.11'
+          cache: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version: '22'
+      - name: Install pinned verification tools
+        run: |
+          go install honnef.co/go/tools/cmd/staticcheck@v0.7.0
+          go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
+          go install github.com/google/go-licenses@v1.6.0
+      - name: Required end-to-end closure
+        run: |
+          test "$(git rev-parse HEAD)" = ebee8dd591947a8fa678b2711332474a3e3745e8
+          make verify
+      - name: Committed source remains unchanged
+        if: always()
+        run: git diff --exit-code
