@@ -136,6 +136,25 @@ func (store *volumeDeliveryStore) completed(entry *volumeDelivery) {
 // Proof halves are retained too. Reserve their conservative high-water cost
 // before merge; replacement never reduces the budget while requests may hold
 // the prior report. In-flight request arguments are transient, not store state.
+// proofFits reports, without reserving or evicting anything, whether the
+// store could retain that proof for the delivery.
+func (store *volumeDeliveryStore) proofFits(entry *volumeDelivery, report *overviewModelAttestation) bool {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if store.entries[entry.id] != entry {
+		return false
+	}
+	if report == nil {
+		return true
+	}
+	encoded, err := json.Marshal(report)
+	if err != nil {
+		return false
+	}
+	cost := 8*len(encoded) + 4096
+	return cost <= entry.proofBytes || entry.bytes+cost-entry.proofBytes <= store.maxBytes
+}
+
 func (store *volumeDeliveryStore) reserveProof(entry *volumeDelivery, report *overviewModelAttestation) error {
 	if report == nil {
 		return nil
@@ -183,6 +202,29 @@ func (store *volumeDeliveryStore) remove(entry *volumeDelivery) {
 	}
 }
 
+// supersede drops every delivery of one Host session for one requested scope
+// but the one that replaces them, whatever index identity they carried: a
+// fresh request for that scope that is answered with a body replaces them
+// all. keep is nil when the replacement is served the live way.
+func (store *volumeDeliveryStore) supersede(owner volumeDeliveryOwner, requestedScope string, keep *volumeDelivery) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	for id, entry := range store.entries {
+		if entry != keep && entry.owner == owner && entry.ctx.RequestedScope == requestedScope {
+			delete(store.entries, id)
+			store.bytes -= entry.bytes
+		}
+	}
+}
+
+// holds reports whether the store still keeps that delivery: one superseded,
+// evicted, or expired while a request for it waited is gone.
+func (store *volumeDeliveryStore) holds(entry *volumeDelivery) bool {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	return store.entries[entry.id] == entry
+}
+
 func newVolumeDelivery(owner volumeDeliveryOwner, ctx overviewRenderContext, guard *overviewSourceGuard, semantic semanticChangeFacts, identity string, tokens int) (*volumeDelivery, error) {
 	nonce := make([]byte, 16)
 	if _, err := rand.Read(nonce); err != nil {
@@ -205,6 +247,7 @@ func newVolumeDelivery(owner volumeDeliveryOwner, ctx overviewRenderContext, gua
 		entry.bytes += 192 * len(ctx.Anchor.Objects)
 	}
 	entry.ctx.Session = newCognitionRefreshSession()
+	entry.ctx.DeliveryID = entry.id
 	return entry, nil
 }
 
@@ -295,26 +338,44 @@ func deliveryCompleted(delivery overviewRendered, entry *volumeDelivery) bool {
 // Postflight repeats the cheap input guard, never the full policy evaluation.
 // A nil result means the store could not retain the proof this call carries:
 // the delivery is dropped and the caller serves the request the live way.
+//
+// From scoring to recording, the request holds the Host session's lock: a
+// proof is judged against the delivery that is current and its result is
+// recorded while that is still the case, so no fresh request can replace the
+// delivery between the two. A request that waited for the lock while its
+// delivery was replaced finds it gone and asks for a restart.
 func serveVolumeDelivery(root string, input overviewIn, loaded *cognitionRepoCtx, refresh *cognitionRefreshSession, entry *volumeDelivery, start time.Time) *mcp.CallToolResult {
 	if err := entry.guard.validate(root, loaded); err != nil {
 		refresh.deliveries.remove(entry)
 		return overviewSnapshotFailure()
-	}
-	if err := refresh.deliveries.reserveProof(entry, input.ModelAttestation); err != nil {
-		refresh.deliveries.remove(entry)
-		return nil
 	}
 	hostReasons, eventID, fail := normalizeRefreshInput(input)
 	if fail != nil {
 		return failResult(fail)
 	}
 	refresh.mu.Lock()
+	defer refresh.mu.Unlock()
+	if !refresh.deliveries.holds(entry) {
+		return errResult(errBadArgs, "overview_session_unavailable_restart_required", "")
+	}
+	if !refresh.deliveries.proofFits(entry, input.ModelAttestation) {
+		// The live path takes over, with the halves this delivery already
+		// accepted: they move to the Host session's own memory.
+		for key, evidence := range entry.ctx.Session.deliveryEvidence {
+			kept := *evidence
+			refresh.deliveryEvidence[key] = &kept
+		}
+		refresh.deliveries.remove(entry)
+		return nil
+	}
 	ctx := entry.ctx
 	ctx.Assessment = refresh.evaluate(input, ctx.Receipt, entry.semantic, hostReasons, eventID)
 	delivery, err := renderOverviewDelivery(ctx, input, entry.tokens)
-	refresh.mu.Unlock()
 	if err != nil {
 		return errResult(errBadArgs, err.Error(), "")
+	}
+	if overviewRenderedHook != nil {
+		overviewRenderedHook()
 	}
 	if err := entry.guard.validate(root, loaded); err != nil {
 		refresh.deliveries.remove(entry)
@@ -326,7 +387,12 @@ func serveVolumeDelivery(root string, input overviewIn, loaded *cognitionRepoCtx
 	if deliveryCompleted(delivery, entry) {
 		refresh.deliveries.completed(entry)
 	}
-	refresh.mu.Lock()
+	// The response stands. Only now is room made for its proof (which may
+	// evict another delivery) and its proof memory written.
+	if err := refresh.deliveries.reserveProof(entry, input.ModelAttestation); err == nil {
+		delivery.evidence.commit()
+	}
+	refresh.commitTransport(entry.owner, ctx.RequestedScope, entry.id, input, delivery.Facts)
 	// A reused delivery is never fresh, so it opens no attempt; its scope still
 	// matters, because a confirmed complete delivery is the proof that clears
 	// the capacity verdict (#168).
@@ -334,7 +400,6 @@ func serveVolumeDelivery(root string, input overviewIn, loaded *cognitionRepoCtx
 	refresh.noteDeliveryChain(&delivery, ctx.Prepared.body.Receipt.BodySHA256, false, fullScope, ctx.Assessment.RefreshReasons, ctx.EstimatedTokens)
 	refresh.recordAttestedDelivery(ctx.Receipt, delivery.Attestation, entry.semantic.GovernanceAligned)
 	refresh.settleDeltaBase(ctx, delivery.Attestation)
-	refresh.mu.Unlock()
 	ledger.Append(root, loaded.cfg.LedgerEnabled, delivery.Facts.ledgerEvent(time.Since(start).Milliseconds()))
 	recordOverviewProofEvents(root, loaded.cfg.LedgerEnabled, input, delivery, ctx.Prepared.body)
 	recordCapacityEvents(root, loaded.cfg.LedgerEnabled, ctx.ScopeIdentity, ctx.Assessment.Interruption, nil, overviewDeliveryPlan{}, nil)
