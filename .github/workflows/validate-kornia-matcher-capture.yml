@@ -54,6 +54,9 @@ jobs:
         run: |
           set -euo pipefail
           pixi run -e py312 uv run --no-sync uv pip install --reinstall-package torch --index-url https://download.pytorch.org/whl/cpu torch==2.5.1
+          .venv-py312/bin/python .github/scripts/check_torch_env.py --list-undeclared-sidecars | tee validation-results/sidecars-before-cleanup.log
+          pixi run -e py312 uv run --no-sync uv pip uninstall triton
+          .venv-py312/bin/python .github/scripts/check_torch_env.py --channel pinned --expected 2.5.1 | tee validation-results/coherent-torch-environment.log
           .venv-py312/bin/python -c 'import sys,torch,kornia; from pathlib import Path; print(sys.executable, sys.version, torch.__version__, kornia.__file__); assert sys.version_info[:2] == (3,12); assert torch.__version__.split("+")[0] == "2.5.1"; assert torch.version.cuda is None; assert Path(kornia.__file__).resolve() == Path("kornia/__init__.py").resolve()' | tee validation-results/minimum-environment.log
       - name: Reproduce the original export failure on both production revisions
         shell: bash
