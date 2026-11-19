@@ -9,6 +9,8 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"runtime"
+	"slices"
 	"sort"
 	"strings"
 
@@ -574,9 +576,10 @@ func assess(root string, cfg *config.Config, set *cognition.Set, snapshot **mana
 				SafeRepairAction: "restore LF line endings in this Volume, or set \"* text=auto eol=lf\" in .gitattributes and check the file out again",
 			})
 		case !matched:
+			cause, action := volumeUnbaselined(root, asset.Descriptor.Path, state)
 			facts.Findings = append(facts.Findings, Finding{
 				Code: "database_volume_unbaselined", Domain: cognition.ScopeDatabase, Target: asset.Descriptor.Path,
-				SafeRepairAction: volumeUnbaselinedRepairAction(root, asset.Descriptor.Path, state),
+				Cause: cause, SafeRepairAction: action,
 			})
 		}
 	} else {
@@ -736,6 +739,10 @@ func assessCode(root string, cfg *config.Config, set *cognition.Set, baselineSta
 	}
 	if managed.ScopeChangeRequired {
 		facts.Findings = append(facts.Findings, Finding{Code: "scope_change_required", Domain: cognition.ScopeCode})
+		// A Scope Change guards the bytes of every formal asset, so a Volume
+		// that left its Baseline record is still named here: activation would
+		// refuse over it, and the restore comes first.
+		appendCodeVolumeBaselineFinding(root, cfg, baselineState, asset.Descriptor.Path, facts)
 		return
 	}
 	// Formal assets leave both the snapshot and the Baseline here, through the
@@ -787,20 +794,27 @@ func assessCode(root string, cfg *config.Config, set *cognition.Set, baselineSta
 	if facts.ManagedScope.ObservedPendingReview > 0 {
 		facts.Findings = append(facts.Findings, Finding{Code: "observed_pending", Domain: cognition.ScopeCode})
 	}
-	switch matched, lineEndingOnly := baselineMatches(root, cfg, baselineState, asset.Descriptor.Path); {
+	appendCodeVolumeBaselineFinding(root, cfg, baselineState, asset.Descriptor.Path, facts)
+}
+
+// appendCodeVolumeBaselineFinding compares the Code Volume's bytes with its
+// Baseline record and names the difference.
+func appendCodeVolumeBaselineFinding(root string, cfg *config.Config, baselineState *baseline.Baseline, rel string, facts *Facts) {
+	switch matched, lineEndingOnly := baselineMatches(root, cfg, baselineState, rel); {
 	case matched && lineEndingOnly:
 		// Equivalent under the team's own tolerance, so it neither blocks nor
 		// creates authoring debt. It is still reported, because the raw bytes did
 		// move and a Scope Change will refuse until they are restored.
 		facts.Findings = append(facts.Findings, Finding{
-			Code: "code_volume_line_ending_only", Domain: cognition.ScopeCode, Target: asset.Descriptor.Path,
+			Code: "code_volume_line_ending_only", Domain: cognition.ScopeCode, Target: rel,
 			Cause:            "line_ending_rewrite",
 			SafeRepairAction: "restore LF line endings in this Volume, or set \"* text=auto eol=lf\" in .gitattributes and check the file out again",
 		})
 	case !matched:
+		cause, action := volumeUnbaselined(root, rel, baselineState)
 		facts.Findings = append(facts.Findings, Finding{
-			Code: "code_volume_unbaselined", Domain: cognition.ScopeCode, Target: asset.Descriptor.Path,
-			SafeRepairAction: volumeUnbaselinedRepairAction(root, asset.Descriptor.Path, baselineState),
+			Code: "code_volume_unbaselined", Domain: cognition.ScopeCode, Target: rel,
+			Cause: cause, SafeRepairAction: action,
 		})
 	}
 }
@@ -903,15 +917,95 @@ func assessFormalAsset(
 // first names the Scope Change, Locale switch, or Observe review the restored
 // Baseline needs.
 func volumeUnbaselinedRepairAction(root, rel string, state *baseline.Baseline) string {
+	_, action := volumeUnbaselined(root, rel, state)
+	return action
+}
+
+// CauseVolumeChangedAfterBaseline is the cause of a *_volume_unbaselined
+// finding whose Volume the Baseline records with other bytes: the one case
+// the restore-from-one-commit repair applies to.
+const CauseVolumeChangedAfterBaseline = "changed_after_baseline"
+
+// volumeUnbaselined answers the cause token and the repair sentence together,
+// so the two can never name different causes.
+func volumeUnbaselined(root, rel string, state *baseline.Baseline) (string, string) {
 	if state != nil {
 		if _, recorded := state.Files[rel]; recorded {
-			return "this Volume's bytes changed after the Baseline was established, for example by a merge; restore the Root, every Volume, and .aoci/baseline.json together from one commit, then run aoci_maintain: after any Scope Change, Locale switch, or Observe review it names first, it returns every source or table that commit's Entries do not describe"
+			return CauseVolumeChangedAfterBaseline, "this Volume's bytes changed after the Baseline was established, for example by a merge; restore the Root, every Volume, and .aoci/baseline.json together from one commit, then run aoci_maintain: after any Scope Change, Locale switch, or Observe review it names first, it returns every source or table that commit's Entries do not describe; a conflicted .aoci/database-baseline.json is resolved separately, to either side's whole file, and the snapshot and accept Maintain names next rebind it to the database as it is now"
 		}
 	}
 	if ignored, _ := afs.PathIgnoredByGit(root, rel); ignored {
-		return "this Volume is hidden from Git, so scan never recorded it; remove the ignore rule covering it and run scan again"
+		return "hidden_from_git", "this Volume is hidden from Git, so scan never recorded it; remove the ignore rule covering it and run scan again"
 	}
-	return "this Volume has no Baseline record; run scan on a repository where the Volume is visible to Git"
+	return "no_baseline_record", "this Volume has no Baseline record; run scan on a repository where the Volume is visible to Git"
+}
+
+// RestoreSet lists what the restore-from-one-commit repair restores together
+// when a recorded object Volume no longer matches its Baseline record: the
+// Root, the Meta, every enabled object Volume, and the Baseline. It is empty
+// when no finding calls for that repair.
+func (facts *Facts) RestoreSet() []string {
+	if facts == nil {
+		return nil
+	}
+	needed := false
+	for _, finding := range facts.Findings {
+		if strings.HasSuffix(finding.Code, "_volume_unbaselined") && finding.Cause == CauseVolumeChangedAfterBaseline {
+			needed = true
+		}
+	}
+	if !needed {
+		return nil
+	}
+	paths := []string{}
+	for index, asset := range []AssetState{facts.Root, facts.Meta, facts.Code, facts.Database} {
+		// A domain the Root does not enable has a registered path and no file.
+		if index >= 2 && !asset.Enabled {
+			continue
+		}
+		if asset.Path != "" && !slices.Contains(paths, asset.Path) {
+			paths = append(paths, asset.Path)
+		}
+	}
+	return append(paths, ".aoci/baseline.json")
+}
+
+// RestoreCommand spells the restore as one git command bound to the
+// repository root, so it reaches that repository from any directory:
+// `git -C <root> checkout {commit} -- <RestoreSet>`. It is empty when nothing
+// calls for the restore or a path cannot be quoted for the Host's shell.
+func (facts *Facts) RestoreCommand(root string) string {
+	paths := facts.RestoreSet()
+	if len(paths) == 0 || root == "" {
+		return ""
+	}
+	command := "git -C"
+	for index, argument := range append([]string{root}, paths...) {
+		quoted, ok := quoteShellArgument(argument)
+		if !ok {
+			return ""
+		}
+		if index == 1 {
+			command += " " + machinecontract.RemediationGitRestoreFormalAssets
+		}
+		command += " " + quoted
+	}
+	return command
+}
+
+// quoteShellArgument quotes one argument for the Host's shell: double quotes
+// on Windows, where a path cannot hold one, single quotes elsewhere.
+func quoteShellArgument(argument string) (string, bool) {
+	if strings.ContainsAny(argument, "\x00\r\n") {
+		return "", false
+	}
+	if runtime.GOOS == "windows" {
+		if strings.Contains(argument, `"`) {
+			return "", false
+		}
+		return `"` + argument + `"`, true
+	}
+	return "'" + strings.ReplaceAll(argument, "'", `'"'"'`) + "'", true
 }
 
 func assessDatabase(root string, cfg *config.Config, facts *Facts) {
