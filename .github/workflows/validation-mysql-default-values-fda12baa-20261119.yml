@@ -1,0 +1,112 @@
+name: Validate MySQL default value preservation
+on:
+  push:
+    branches: [validation/mysql-default-values-fda12baa-20261119]
+permissions:
+  contents: read
+jobs:
+  fast:
+    if: github.repository == 'Afloat16/aoci-code'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: Afloat16/aoci-code
+          ref: 4f9c572c9c67c1b812f72daeeb201fe8e4657cc3
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version: '1.26.11'
+          cache: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version: '22'
+      - name: Verify exact source and default value regressions
+        run: |
+          test "$(git rev-parse HEAD)" = 4f9c572c9c67c1b812f72daeeb201fe8e4657cc3
+          go test -v -count=1 -run '^TestCanonical(MySQLDefault|OtherDefault)' ./internal/dbevidence
+      - name: Required fast gate
+        run: make fast
+      - name: Formal index quality on committed source
+        run: |
+          make build
+          bash scripts/check-index-quality.sh build/aoci
+          git diff --exit-code
+  verify:
+    if: github.repository == 'Afloat16/aoci-code'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: Afloat16/aoci-code
+          ref: 4f9c572c9c67c1b812f72daeeb201fe8e4657cc3
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version: '1.26.11'
+          cache: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version: '22'
+      - name: Install pinned verification tools
+        run: |
+          go install honnef.co/go/tools/cmd/staticcheck@v0.7.0
+          go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
+          go install github.com/google/go-licenses@v1.6.0
+      - name: Required end-to-end closure
+        run: |
+          test "$(git rev-parse HEAD)" = 4f9c572c9c67c1b812f72daeeb201fe8e4657cc3
+          make verify
+      - name: Committed source remains unchanged
+        if: always()
+        run: git diff --exit-code
+  mysql:
+    if: github.repository == 'Afloat16/aoci-code'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        mysql: ['5.7', '8.4']
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: Afloat16/aoci-code
+          ref: 4f9c572c9c67c1b812f72daeeb201fe8e4657cc3
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version: '1.26.11'
+          cache: false
+      - name: Start disposable MySQL
+        env:
+          MYSQL_IMAGE: mysql:${{ matrix.mysql }}
+        run: |
+          password="$(openssl rand -hex 24)"
+          echo "::add-mask::$password"
+          docker run -d --name aoci-mysql-defaults -e MYSQL_ROOT_PASSWORD="$password" -e MYSQL_DATABASE=aoci_test -p 127.0.0.1::3306 "$MYSQL_IMAGE"
+          ready=false
+          for attempt in $(seq 1 90); do
+            if docker exec -e MYSQL_PWD="$password" aoci-mysql-defaults mysqladmin --protocol=tcp -h 127.0.0.1 -uroot ping --silent; then
+              ready=true
+              break
+            fi
+            sleep 2
+          done
+          test "$ready" = true
+          port="$(docker port aoci-mysql-defaults 3306/tcp | cut -d: -f2)"
+          echo "AOCI_TEST_MYSQL_ADMIN_DSN=root:$password@tcp(127.0.0.1:$port)/aoci_test" >> "$GITHUB_ENV"
+      - name: Verify real default drift and existing catalog acceptance
+        run: |
+          test "$(git rev-parse HEAD)" = 4f9c572c9c67c1b812f72daeeb201fe8e4657cc3
+          log="$RUNNER_TEMP/mysql-default-fixed.log"
+          go test -v -count=1 -tags=integration ./internal/dbevidence -run '^(TestMySQLDefaultValuesPreserveCatalogBytesAndDrift|TestMySQLRealCatalogCollectionAndDrift)$' | tee "$log"
+          ! grep -F -- '--- SKIP' "$log"
+      - name: Committed source remains unchanged
+        if: always()
+        run: git diff --exit-code
+      - name: Stop disposable MySQL
+        if: always()
+        run: docker rm -f aoci-mysql-defaults
