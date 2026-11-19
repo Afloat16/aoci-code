@@ -1,0 +1,43 @@
+name: git-head-fallback-targeted
+on:
+  push:
+    branches: [validation/git-head-fallback-targeted-20261119]
+permissions:
+  contents: read
+jobs:
+  targeted:
+    if: github.repository == 'Afloat16/aoci-code'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: bb556f1c3a818d51680fa324e653d0ec2ff6b0cd
+          fetch-depth: 2
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Verify exact source identity
+        run: test "$(git rev-parse HEAD)" = bb556f1c3a818d51680fa324e653d0ec2ff6b0cd
+      - name: Reproduce stale HEAD and unsupported metadata on upstream
+        shell: bash
+        run: |
+          git show 2a8a809dcbeb406ee9493551a4d5c698a1901d9c:internal/fs/git_head.go > internal/fs/git_head.go
+          set +e
+          go test -count=1 -v ./internal/fs ./internal/businesssource -run '^(TestGitHeadFastDoesNotFallBackPastExistingLooseRef|TestGitHeadFastDoesNotIgnoreUnsupportedCommonDir|TestManifestGitHeadUsesGitForUnsupportedLooseRef)$' > "$RUNNER_TEMP/git-head-before.log" 2>&1
+          status=$?
+          set -e
+          cat "$RUNNER_TEMP/git-head-before.log"
+          test "$status" -eq 1
+          grep -F -- '--- FAIL: TestGitHeadFastDoesNotFallBackPastExistingLooseRef' "$RUNNER_TEMP/git-head-before.log"
+          grep -F -- '--- FAIL: TestGitHeadFastDoesNotIgnoreUnsupportedCommonDir' "$RUNNER_TEMP/git-head-before.log"
+          grep -F -- '--- FAIL: TestManifestGitHeadUsesGitForUnsupportedLooseRef' "$RUNNER_TEMP/git-head-before.log"
+          git restore --source=bb556f1c3a818d51680fa324e653d0ec2ff6b0cd -- internal/fs/git_head.go
+      - name: Run both affected packages
+        run: go test -count=1 -v ./internal/fs ./internal/businesssource
+      - name: Vet affected packages and check source
+        run: |
+          go vet ./internal/fs ./internal/businesssource
+          git diff --exit-code
