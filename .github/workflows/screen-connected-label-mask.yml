@@ -1,0 +1,57 @@
+name: Screen connected component masking
+on:
+  push:
+    branches: [validation/connected-label-mask-20261120]
+permissions:
+  contents: read
+concurrency:
+  group: validation-connected-label-mask-20261120
+  cancel-in-progress: true
+jobs:
+  screen:
+    if: github.repository == 'Afloat16/aoci-code'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      UV_NO_SYNC: "1"
+      MKL_NUM_THREADS: "1"
+      OMP_NUM_THREADS: "1"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: Afloat16/kornia
+          ref: e536b8d0df63acd82b99062fe51fcabe48b26ac8
+          fetch-depth: 2
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          path: validation-harness
+          persist-credentials: false
+          sparse-checkout: validation/connected-label-mask.py
+      - uses: prefix-dev/setup-pixi@v0.11.3
+        with:
+          pixi-version: v0.40.0
+          cache: false
+      - name: Prepare exact source and Pixi environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = e536b8d0df63acd82b99062fe51fcabe48b26ac8
+          mkdir -p validation-results
+          git show 7ecfbb392285e03f73b4dd4cce62fc3fb8349c33:kornia/contrib/connected_components.py > validation-results/connected_components-base.py
+          pixi run -e py312 install
+          git diff --check
+      - name: Screen public API correctness, timing and allocation
+        shell: bash
+        run: |
+          set -euo pipefail
+          .venv-py312/bin/python -u - < validation-harness/validation/connected-label-mask.py 2>&1 | tee validation-results/screen.log
+          git diff --exit-code
+      - name: Preserve measurements
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: connected-label-mask-screen-e536b8d
+          path: validation-results/
+          if-no-files-found: warn
+          retention-days: 14
