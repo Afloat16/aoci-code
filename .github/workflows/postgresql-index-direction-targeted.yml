@@ -1,0 +1,127 @@
+name: postgresql-index-direction-targeted
+
+on:
+  push:
+    branches: [validation/postgresql-index-direction-targeted-20261119]
+
+permissions:
+  contents: read
+
+jobs:
+  native-postgresql:
+    if: github.repository == 'Afloat16/aoci-code'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: f1bcd4805a7565952424be39a122ec5627cbdb25
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Verify source identity
+        run: test "$(git rev-parse HEAD)" = f1bcd4805a7565952424be39a122ec5627cbdb25
+      - name: Start isolated PostgreSQL
+        run: |
+          password="aoci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          echo "::add-mask::${password}"
+          echo "AOCI_TEST_POSTGRES_ADMIN_PASSWORD=${password}" >> "$GITHUB_ENV"
+          echo 'AOCI_TEST_POSTGRES_ADMIN_USER=postgres' >> "$GITHUB_ENV"
+          echo 'AOCI_TEST_POSTGRES_ADMIN_DATABASE=postgres' >> "$GITHUB_ENV"
+          docker run -d --name "aoci-pg-${GITHUB_RUN_ID}" -p 127.0.0.1::5432 -e POSTGRES_PASSWORD="${password}" postgres:18 >/dev/null
+          port="$(docker port "aoci-pg-${GITHUB_RUN_ID}" 5432/tcp | head -n1 | sed 's/.*://')"
+          test -n "$port"
+          echo "AOCI_TEST_POSTGRES_ADMIN_ADDR=127.0.0.1:${port}" >> "$GITHUB_ENV"
+          for attempt in $(seq 1 30); do docker exec "aoci-pg-${GITHUB_RUN_ID}" pg_isready -U postgres >/dev/null 2>&1 && break; sleep 1; done
+          docker exec "aoci-pg-${GITHUB_RUN_ID}" pg_isready -U postgres >/dev/null
+      - name: Reproduce direction loss on original production code
+        run: |
+          git fetch --no-tags --depth=1 origin 49ed1665a43a8a24392547aa61bd2c7ac75c445b
+          git show 49ed1665a43a8a24392547aa61bd2c7ac75c445b:internal/dbevidence/queries.go > internal/dbevidence/queries.go
+          git show 49ed1665a43a8a24392547aa61bd2c7ac75c445b:internal/dbevidence/collector_postgresql.go > internal/dbevidence/collector_postgresql.go
+          set +e
+          go test -v -tags=integration -count=1 -run '^TestPostgreSQLRealCatalogCollectionAndDriftIndexDirections$' ./internal/dbevidence > baseline-regression.log 2>&1
+          result=$?
+          set -e
+          cat baseline-regression.log
+          test "$result" -ne 0
+          grep -q 'directions: got' baseline-regression.log
+          grep -q 'direction-only change was not detected' baseline-regression.log
+          go test -v -tags=integration -count=1 -run '^TestPostgreSQLRealCatalogCollectionAndDrift$' ./internal/dbevidence > baseline-acceptance.log 2>&1
+          cat baseline-acceptance.log
+          git restore --source=f1bcd4805a7565952424be39a122ec5627cbdb25 --worktree -- internal/dbevidence/queries.go internal/dbevidence/collector_postgresql.go
+      - name: Verify fixed package and native direction transitions
+        run: |
+          go test -v -count=1 ./internal/dbevidence
+          go test -v -tags=integration -count=1 -run '^TestPostgreSQLRealCatalogCollectionAndDriftIndexDirections$' ./internal/dbevidence
+          go vet ./internal/dbevidence
+      - name: Capture intentional production identity change
+        run: |
+          set +e
+          go test -v -tags=integration -count=1 -run '^TestPostgreSQLRealCatalogCollectionAndDrift$' ./internal/dbevidence > fixed-acceptance.log 2>&1
+          result=$?
+          set -e
+          cat fixed-acceptance.log
+          test "$result" -ne 0
+          grep -q 'real postgresql acceptance identity drifted' fixed-acceptance.log
+      - name: Derive the reviewed Golden from exact production bytes
+        run: |
+          python3 - <<'PY'
+          import base64, copy, hashlib, json, pathlib, re
+          def evidence(log, label):
+              matches = re.findall(label + r' base64=([A-Za-z0-9+/=]+)', pathlib.Path(log).read_text())
+              assert len(matches) == 1, (label, len(matches))
+              return base64.b64decode(matches[0], validate=True)
+          before = evidence('baseline-acceptance.log', 'postgresql_snapshot_identity')
+          after = evidence('fixed-acceptance.log', 'postgresql_snapshot_identity')
+          before_orders = json.loads(evidence('baseline-acceptance.log', 'postgresql_index_evidence'))
+          after_orders = json.loads(evidence('fixed-acceptance.log', 'postgresql_index_evidence'))
+          path = pathlib.Path('internal/dbevidence/testdata/real/acceptance.json')
+          golden = json.loads(path.read_text())
+          pg = next(e for e in golden['engines'] if e['engine'] == 'postgresql')
+          assert hashlib.sha256(before).hexdigest() == pg['source_snapshot_sha256']
+          new_sha = hashlib.sha256(after).hexdigest()
+          assert new_sha != pg['source_snapshot_sha256']
+          changed = []
+          for index in after_orders['indexes']:
+              for element in index['elements']:
+                  if element.pop('descending', False):
+                      changed.append((index['name'], element['position']))
+          assert changed == [('orders_active_idx', 2)], changed
+          assert after_orders == before_orders
+          old, new = json.loads(before), json.loads(after)
+          old_tables = {t['object_ref']: t for t in old['tables']}
+          new_tables = {t['object_ref']: t for t in new['tables']}
+          assert old_tables.keys() == new_tables.keys()
+          orders = 'database://pgtemp/aoci_d0/orders'
+          for key in old_tables:
+              if key != orders:
+                  assert old_tables[key] == new_tables[key], key
+          old_parts = dict(old_tables[orders]['component_hashes'])
+          new_parts = dict(new_tables[orders]['component_hashes'])
+          assert old_parts.pop('indexes') != new_parts.pop('indexes')
+          assert old_parts == new_parts
+          restored = copy.deepcopy(new)
+          restored['tables'] = old['tables']
+          assert restored == old
+          canonical_label = r'canonical_table_evidence engine=postgresql object_ref=database://pgtemp/aoci_d0/accounts'
+          account_before = evidence('baseline-acceptance.log', canonical_label)
+          account_after = evidence('fixed-acceptance.log', canonical_label)
+          assert account_before == account_after == pathlib.Path('internal/dbevidence/' + pg['canonical_evidence_ref']).read_bytes()
+          assert hashlib.sha256(account_after).hexdigest() == pg['table_evidence_sha256']
+          print('Only orders_active_idx element 2 gained descending=true; other source facts and all other component identities unchanged')
+          print('Production-derived PostgreSQL source_snapshot_sha256=' + new_sha)
+          pg['source_snapshot_sha256'] = new_sha
+          path.write_text(json.dumps(golden, indent=2) + '\n')
+          PY
+          git diff -- internal/dbevidence/testdata/real/acceptance.json
+      - name: Run the complete native PostgreSQL contract
+        run: |
+          go test -v -tags=integration -count=1 -run TestPostgreSQLRealCatalogCollectionAndDrift ./internal/dbevidence
+          test "$(git diff --name-only)" = internal/dbevidence/testdata/real/acceptance.json
+          git diff --check
+      - name: Stop isolated PostgreSQL
+        if: always()
+        run: docker rm -f "aoci-pg-${GITHUB_RUN_ID}" >/dev/null 2>&1 || true
