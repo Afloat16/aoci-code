@@ -1,0 +1,45 @@
+name: git-ignore-negation-targeted-validation
+
+on:
+  push:
+    branches: [validation/git-ignore-targeted-20261119]
+
+permissions:
+  contents: read
+
+jobs:
+  targeted:
+    if: github.repository == 'Afloat16/aoci-code'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: 37060334c839aaa7439e505942b17e1f4a047be3
+          fetch-depth: 2
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Verify exact source identity
+        run: test "$(git rev-parse HEAD)" = 37060334c839aaa7439e505942b17e1f4a047be3
+      - name: Prove the new regressions fail on the upstream implementation
+        shell: bash
+        run: |
+          git show a3b844ed0df5df2b7cec17df43dd5e92e0285f76:internal/fs/git_ignore.go > internal/fs/git_ignore.go
+          set +e
+          go test -count=1 -v ./internal/fs ./internal/cli ./internal/volumegovernance -run 'TestPathIgnoredByGit|TestInitAdvancesBaselineForGitUnignoredAgentRules|TestUnbaselinedVolumeNamesWhichOfTwoCausesItIs' > "$RUNNER_TEMP/git-ignore-before.log" 2>&1
+          status=$?
+          set -e
+          cat "$RUNNER_TEMP/git-ignore-before.log"
+          test "$status" -eq 1
+          for name in TestPathIgnoredByGitDistinguishesNegativeRules TestPathIgnoredByGitUsesUnquotedPatternFields TestInitAdvancesBaselineForGitUnignoredAgentRules TestUnbaselinedVolumeNamesWhichOfTwoCausesItIs; do
+            grep -F -- "--- FAIL: $name" "$RUNNER_TEMP/git-ignore-before.log"
+          done
+          git restore --source=37060334c839aaa7439e505942b17e1f4a047be3 -- internal/fs/git_ignore.go
+      - name: Test the fixed packages
+        run: go test -count=1 -v ./internal/fs ./internal/cli ./internal/volumegovernance
+      - name: Check source bytes
+        if: always()
+        run: git diff --exit-code
