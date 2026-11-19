@@ -1,0 +1,66 @@
+name: Validate Git ignore main refresh
+on:
+  push:
+    branches: [validation/git-ignore-main-fda12baa-20261120]
+permissions:
+  contents: read
+jobs:
+  fast:
+    if: github.repository == 'Afloat16/aoci-code'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: Afloat16/aoci-code
+          ref: 9c3daedbef8acca7871bf8a5932267bd11936e33
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version: '1.26.11'
+          cache: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version: '22'
+      - name: Verify exact source and Git ignore regressions
+        run: |
+          test "$(git rev-parse HEAD)" = 9c3daedbef8acca7871bf8a5932267bd11936e33
+          go test -v -count=1 ./internal/fs -run 'TestPathIgnoredByGit'
+          go test -v -count=1 ./internal/cli -run '^TestInitAdvancesBaselineForGitUnignoredAgentRules$'
+          go test -v -count=1 ./internal/volumegovernance -run '^TestUnbaselinedVolumeNamesWhichOfTwoCausesItIs$'
+      - name: Required fast gate
+        run: make fast
+      - name: Formal index quality on committed source
+        run: |
+          make build
+          bash scripts/check-index-quality.sh build/aoci
+          git diff --exit-code
+  verify:
+    if: github.repository == 'Afloat16/aoci-code'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: Afloat16/aoci-code
+          ref: 9c3daedbef8acca7871bf8a5932267bd11936e33
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version: '1.26.11'
+          cache: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version: '22'
+      - name: Install pinned verification tools
+        run: |
+          go install honnef.co/go/tools/cmd/staticcheck@v0.7.0
+          go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
+          go install github.com/google/go-licenses@v1.6.0
+      - name: Required end-to-end closure
+        run: |
+          test "$(git rev-parse HEAD)" = 9c3daedbef8acca7871bf8a5932267bd11936e33
+          make verify
+      - name: Committed source remains unchanged
+        if: always()
+        run: git diff --exit-code
