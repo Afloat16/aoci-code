@@ -1,0 +1,128 @@
+name: Validate matcher capture compatibility
+on:
+  push:
+    branches: [validation/kornia-matcher-capture-20261119]
+permissions:
+  contents: read
+concurrency:
+  group: validation-kornia-matcher-capture-20261119
+  cancel-in-progress: true
+jobs:
+  compatibility:
+    if: github.repository == 'Afloat16/aoci-code'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      UV_NO_SYNC: "1"
+      KORNIA_TEST_DEVICE: cpu
+      KORNIA_TEST_DTYPE: float64
+      MKL_NUM_THREADS: "1"
+      OMP_NUM_THREADS: "1"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: Afloat16/kornia
+          ref: 0016a299fe3b0481ee96288a8a0597e02f66ab38
+          fetch-depth: 8
+          persist-credentials: false
+      - uses: prefix-dev/setup-pixi@v0.11.3
+        with:
+          pixi-version: v0.40.0
+          cache: false
+      - name: Prepare exact source and locked test environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 0016a299fe3b0481ee96288a8a0597e02f66ab38
+          mkdir -p validation-results
+          git show 7ecfbb392285e03f73b4dd4cce62fc3fb8349c33:kornia/feature/matching.py > validation-results/matching-base.py
+          git show 30e375bbacf2debd56f8a88ebfc0b44b3ab464f0:tests/feature/test_matching.py > validation-results/test-before.py
+          cp kornia/feature/matching.py validation-results/matching-current.py
+          cp tests/feature/test_matching.py validation-results/test-candidate.py
+          pixi run -e py312 install
+          .venv-py312/bin/python -c 'import sys,torch,kornia; print(sys.executable, sys.version, torch.__version__, kornia.__file__); assert sys.version_info[:2] == (3,12)' | tee validation-results/locked-environment.log
+          git diff --check
+      - name: Check current Torch capture coverage and all pre-commit hooks
+        shell: bash
+        run: |
+          set -euo pipefail
+          KORNIA_TEST_OPTIMIZER=inductor pixi run -e py312 test-module tests/feature/test_matching.py -k chunk_selector_keeps_dynamic_shapes --device=cpu --dtype=float64 -q --junitxml=validation-results/current-capture.xml 2>&1 | tee validation-results/current-capture.log
+          pixi run -e py312 pre-commit-all 2>&1 | tee validation-results/pre-commit.log
+          git diff --exit-code
+      - name: Install and verify minimum supported Torch
+        shell: bash
+        run: |
+          set -euo pipefail
+          pixi run -e py312 uv run --no-sync uv pip install --reinstall-package torch --index-url https://download.pytorch.org/whl/cpu torch==2.5.1
+          .venv-py312/bin/python -c 'import sys,torch,kornia; from pathlib import Path; print(sys.executable, sys.version, torch.__version__, kornia.__file__); assert sys.version_info[:2] == (3,12); assert torch.__version__.split("+")[0] == "2.5.1"; assert torch.version.cuda is None; assert Path(kornia.__file__).resolve() == Path("kornia/__init__.py").resolve()' | tee validation-results/minimum-environment.log
+      - name: Reproduce the original export failure on both production revisions
+        shell: bash
+        run: |
+          set -euo pipefail
+          trap 'cp validation-results/matching-current.py kornia/feature/matching.py; cp validation-results/test-candidate.py tests/feature/test_matching.py' EXIT
+          cp validation-results/test-before.py tests/feature/test_matching.py
+          for revision in base current; do
+            cp "validation-results/matching-$revision.py" kornia/feature/matching.py
+            set +e
+            env -u KORNIA_TEST_OPTIMIZER pixi run -e py312 test-module tests/feature/test_matching.py -k 'chunk_selector_keeps_dynamic_shapes and export' --device=cpu --dtype=float64 -q "--junitxml=validation-results/original-export-$revision.xml" > "validation-results/original-export-$revision.log" 2>&1
+            result=$?
+            set -e
+            cat "validation-results/original-export-$revision.log"
+            test "$result" -eq 1
+            .venv-py312/bin/python -c 'import sys,xml.etree.ElementTree as E; r=E.parse(sys.argv[1]); c=r.findall(".//testcase"); assert len(c)==1; f=c[0].find("failure"); assert f is not None and c[0].find("error") is None; assert "replace_autocast_with_hop_pass" in f.text and "AssertionError" in f.text' "validation-results/original-export-$revision.xml"
+          done
+      - name: Verify the selector test detects missing capture guards
+        shell: bash
+        run: |
+          set -euo pipefail
+          trap 'cp validation-results/matching-current.py kornia/feature/matching.py' EXIT
+          .venv-py312/bin/python - <<'PY'
+          from pathlib import Path
+          p = Path("kornia/feature/matching.py")
+          text = p.read_text()
+          begin, end = text.index("def _chunked_neighbours("), text.index("def _distance_from_squared(")
+          section = text[begin:end]
+          for guard in ("        or is_compiling()\n", "        or is_exporting()\n"):
+              assert section.count(guard) == 1
+              section = section.replace(guard, "")
+          p.write_text(text[:begin] + section + text[end:])
+          PY
+          set +e
+          env -u KORNIA_TEST_OPTIMIZER pixi run -e py312 test-module tests/feature/test_matching.py -k 'chunk_selector_keeps_dynamic_shapes and export' --device=cpu --dtype=float64 -q --junitxml=validation-results/mutated-selector.xml > validation-results/mutated-selector.log 2>&1
+          result=$?
+          set -e
+          cat validation-results/mutated-selector.log
+          test "$result" -eq 1
+          .venv-py312/bin/python -c 'import xml.etree.ElementTree as E; r=E.parse("validation-results/mutated-selector.xml"); c=r.findall(".//testcase"); assert len(c)==1; f=c[0].find("failure"); assert f is not None and c[0].find("error") is None; assert "ConstraintViolationError" in f.text or "Constraints violated" in f.text'
+      - name: Run exact candidate focused and complete matcher regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          KORNIA_TEST_OPTIMIZER=inductor pixi run -e py312 test-module tests/feature/test_matching.py -k TestChunkedDistanceMatching --device=cpu --dtype=float32,float64 --timeout=600 -q --junitxml=validation-results/focused.xml 2>&1 | tee validation-results/focused.log
+          KORNIA_TEST_OPTIMIZER=inductor pixi run -e py312 test-module tests/feature/test_matching.py --device=cpu --dtype=float64 --timeout=600 -q --junitxml=validation-results/matching.xml 2>&1 | tee validation-results/matching.log
+          env -u KORNIA_TEST_OPTIMIZER pixi run -e py312 test-module tests/feature/test_matching.py -k chunk_selector_keeps_dynamic_shapes --device=cpu --dtype=float64 -q --junitxml=validation-results/unset-export.xml 2>&1 | tee validation-results/unset-export.log
+          git diff --exit-code
+      - name: Verify relevant compile and ONNX conformance
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > validation-results/changed-paths.txt <<'PATHS'
+          kornia/feature/matching.py
+          tests/feature/test_matching.py
+          PATHS
+          for kind in compile onnx; do
+            packages=$(.venv-py312/bin/python .github/scripts/conformance_packages.py "$kind" < validation-results/changed-paths.txt)
+            .venv-py312/bin/python .github/scripts/conformance_packages.py "$kind" < validation-results/changed-paths.txt > "validation-results/$kind-packages.txt"
+            if [ "$kind" = compile ]; then test_file=tests/test_inductor_conformance.py; else test_file=tests/onnx/test_conformance.py; fi
+            pixi run -e py312 test-module "$test_file" "--$kind-conformance=$packages" --device=cpu --dtype=float64 --timeout=600 -q -ra "--junitxml=validation-results/$kind.xml" 2>&1 | tee "validation-results/$kind.log"
+          done
+          git diff --exit-code
+          sha256sum kornia/feature/matching.py tests/feature/test_matching.py > validation-results/final-source-hashes.txt
+      - name: Save exact-source evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: matcher-capture-compat-0016a29
+          path: validation-results/
+          if-no-files-found: warn
+          retention-days: 14
