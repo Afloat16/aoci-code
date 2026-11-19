@@ -91,7 +91,9 @@ ordinal, or implicit offset.
 
 The reconstructable v1 cursor binds the Index SHA-256, configured
 `chunk_tokens`, next Entry ordinal, and previous Chunk SHA-256. Its existing
-live-governance path remains compatible across MCP process restarts.
+live-governance path keeps returning Chunks across MCP process restarts; a
+confirmation needs a fresh request in the serving process (see "Full-body
+receipt and Host confirmation").
 
 Eligible Volumes deliveries use an ephemeral v2 cursor. It additionally binds
 an unpredictable delivery id, the originating MCP Host session, and an HMAC
@@ -155,6 +157,44 @@ count, SHA-256, and both markers. Server production and Host observation are
 different facts. Host delivery becomes confirmed only when the Host reports
 the matching Receipt version, aggregate body SHA-256, byte count, and observed
 end marker. Any missing or mismatched field is incomplete.
+
+A matching confirmation proves a copy, not a transport: the SHA-256 is printed
+on the first Chunk, and an unchanged Index has the SHA-256 it had before. The
+serving process therefore keeps one current delivery for each Host session and
+requested scope, and transport progress, proofs, and retained cursors all
+answer to it:
+
+* a fresh request that is answered with a body makes that body the current
+  delivery of its Host session and scope, at Chunk 1. Whatever was current
+  there is replaced: every delivery that session still held for the scope,
+  whatever Index identity it carried, is superseded with the proof halves
+  remembered for it, and its v2 cursors answer
+  `overview_session_unavailable_restart_required`. A capacity stop and an
+  empty delta send no body and supersede nothing;
+* a request that is refused sends nothing and changes no delivery: a fresh
+  request refused for any reason supersedes no delivery, forgets no proof
+  half, and rebinds no governance snapshot; a Chunk refused after it was
+  rendered is not counted as sent; a refused proof leaves neither half in
+  memory and evicts no other delivery. A refresh reason the refused request
+  declared stays declared: it reports a Host event, not a delivery;
+* a continuation advances the current delivery only when it arrives through
+  it (the same body, the same retained delivery) and only as the next Chunk
+  in order. A request of a superseded delivery that was already in flight,
+  a continuation or a proof, answers
+  `overview_session_unavailable_restart_required` and records nothing;
+* a body that is not current is not sent. After a server restart a v1 cursor
+  still returns its Chunk, and the Host makes a fresh request before it can
+  confirm;
+* two MCP sessions of one server never prove each other's delivery;
+* a confirmation counts only for the current delivery sent to its end,
+  whether it came with the call or from memory; otherwise it is incomplete
+  and is not remembered, and the proof response prints
+  `server_delivery_complete: false`. The Host finishes the chain by its
+  `next_cursor` and confirms again;
+* a proof half for a body not sent to its end closes no compaction reload
+  attempt, whichever half it is.
+
+On a Legacy layout the same rules hold.
 
 The Host requests each Chunk in its own tool call, assembles every Chunk in
 order, verifies each Chunk Receipt and the aggregate body, and observes the
