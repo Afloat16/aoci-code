@@ -37,7 +37,7 @@ metadata["cpu_model"] = next((line.split(":", 1)[1].strip() for line in Path("/p
 metadata["baseline_module_file"] = "baseline-source/kornia/contrib/connected_components.py"
 metadata["allocation_method"] = "Raw CPU profiler memory allocation/free events without shape or stack recording; incremental live tensor bytes above the profile baseline, not RSS"
 metadata["source_sha256"] = {
-    "base": hashlib.sha256((ROOT / "validation-results/connected_components-base.py").read_bytes()).hexdigest(),
+    "base": hashlib.sha256((ROOT / "baseline-source/kornia/contrib/connected_components.py").read_bytes()).hexdigest(),
     "candidate": hashlib.sha256((ROOT / "kornia/contrib/connected_components.py").read_bytes()).hexdigest(),
 }
 results = []
