@@ -1,4 +1,4 @@
-name: Screen connected component masking
+name: Compare connected component masking strategies
 on:
   push:
     branches: [validation/connected-label-mask-20261120]
@@ -20,7 +20,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           repository: Afloat16/kornia
-          ref: e536b8d0df63acd82b99062fe51fcabe48b26ac8
+          ref: 17d9f6273e612e89b60162a20e6d0a00bb5abe50
           fetch-depth: 2
           persist-credentials: false
       - uses: actions/checkout@v7
@@ -36,9 +36,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = e536b8d0df63acd82b99062fe51fcabe48b26ac8
+          test "$(git rev-parse HEAD)" = 17d9f6273e612e89b60162a20e6d0a00bb5abe50
           mkdir -p validation-results
+          git fetch --no-tags origin e536b8d0df63acd82b99062fe51fcabe48b26ac8
           git show 7ecfbb392285e03f73b4dd4cce62fc3fb8349c33:kornia/contrib/connected_components.py > validation-results/connected_components-base.py
+          git show e536b8d0df63acd82b99062fe51fcabe48b26ac8:kornia/contrib/connected_components.py > validation-results/connected_components-multiply.py
           pixi run -e py312 install
           git diff --check
       - name: Screen public API correctness, timing and allocation
@@ -51,7 +53,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: connected-label-mask-screen-e536b8d
+          name: connected-label-mask-screen-17d9f62
           path: validation-results/
           if-no-files-found: warn
           retention-days: 14

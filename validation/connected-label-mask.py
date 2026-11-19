@@ -28,10 +28,14 @@ spec = importlib.util.spec_from_file_location("baseline_connected_components", R
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
 functions = {"base": module.connected_components, "candidate": kornia.contrib.connected_components}
+mid_spec = importlib.util.spec_from_file_location("multiply_connected_components", ROOT / "validation-results/connected_components-multiply.py")
+mid_module = importlib.util.module_from_spec(mid_spec)
+mid_spec.loader.exec_module(mid_module)
+functions["inplace_multiply"] = mid_module.connected_components
 metadata = run_metadata(torch.device("cpu"))
-metadata.update(base_sha="7ecfbb392285e03f73b4dd4cce62fc3fb8349c33", candidate_sha="e536b8d0df63acd82b99062fe51fcabe48b26ac8", seed=0,
+metadata.update(base_sha="7ecfbb392285e03f73b4dd4cce62fc3fb8349c33", candidate_sha="17d9f6273e612e89b60162a20e6d0a00bb5abe50", seed=0,
                 comparison="Public connected_components functions, exact complete source modules, same process alternating order",
-                rounds=7, min_run_time_seconds=0.3,
+                rounds=5, min_run_time_seconds=0.3,
                 cpu_affinity=sorted(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else None)
 metadata["source_sha256"] = {
     "base": hashlib.sha256((ROOT / "validation-results/connected_components-base.py").read_bytes()).hexdigest(),
@@ -62,28 +66,42 @@ for name, value, iterations in cases:
     calls = {revision: (lambda fn=fn: fn(value, iterations)) for revision, fn in functions.items()}
     times = {revision: [] for revision in functions}
     for round_index in range(metadata["rounds"]):
-        order = ("base", "candidate") if round_index % 2 == 0 else ("candidate", "base")
+        keys = list(functions)
+        shift = round_index % len(keys)
+        order = keys[shift:] + keys[:shift]
         for revision in order:
             median, iqr = time_us(calls[revision], min_run_time=metadata["min_run_time_seconds"])
             assert median > 0 and iqr >= 0
             times[revision].append({"round": round_index, "median_us": median, "iqr_us": iqr})
     allocation = {}
-    for revision in ("base", "candidate"):
+    for revision in functions:
         gc.collect()
         with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU], profile_memory=True) as prof:
             out = calls[revision]()
         assert torch.equal(out, expected)
+        trace_path = Path(f"validation-results/{name}-{revision}-trace.json")
+        prof.export_chrome_trace(str(trace_path))
+        events = json.loads(trace_path.read_text())["traceEvents"]
+        memory = [e["args"] for e in events if e.get("name") == "[memory]" and e.get("args", {}).get("Device Type") == 0]
+        assert memory and all("Bytes" in e and "Total Allocated" in e for e in memory)
+        baseline_live = memory[0]["Total Allocated"] - memory[0]["Bytes"]
         allocation[revision] = {
-            "positive_self_cpu_bytes": sum(max(e.self_cpu_memory_usage, 0) for e in prof.events()),
-            "events": [{"name": e.key, "count": e.count, "self_cpu_bytes": e.self_cpu_memory_usage}
-                       for e in prof.key_averages() if e.self_cpu_memory_usage != 0],
+            "positive_allocation_bytes": sum(e["Bytes"] for e in memory if e["Bytes"] > 0),
+            "allocation_count": sum(e["Bytes"] > 0 for e in memory),
+            "peak_extra_live_tensor_bytes": max(e["Total Allocated"] for e in memory) - baseline_live,
+            "baseline_live_tensor_bytes": baseline_live,
+            "trace_memory_events": len(memory),
+            "trace_file": str(trace_path),
         }
+        del out
+        print("ALLOCATION", name, revision, allocation[revision], flush=True)
     row = {"case": name, "shape": list(value.shape), "iterations": iterations, "exact_equal": True,
            "input_unchanged": torch.equal(value, snapshot), "timings": times, "allocation": allocation}
+    row["inplace_multiply_us"] = statistics.median(t["median_us"] for t in times["inplace_multiply"])
     row["base_us"] = statistics.median(t["median_us"] for t in times["base"])
     row["candidate_us"] = statistics.median(t["median_us"] for t in times["candidate"])
     row["relative_time_change_percent"] = 100 * (row["candidate_us"] / row["base_us"] - 1)
-    row["positive_self_cpu_byte_reduction"] = allocation["base"]["positive_self_cpu_bytes"] - allocation["candidate"]["positive_self_cpu_bytes"]
+    row["positive_allocation_byte_reduction"] = allocation["base"]["positive_allocation_bytes"] - allocation["candidate"]["positive_allocation_bytes"]
     results.append(row)
     save_json("validation-results/exploratory.json", metadata, results)
     print(json.dumps(row), flush=True)
