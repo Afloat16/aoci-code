@@ -1,0 +1,54 @@
+name: Validate atomic GCC coverage
+on:
+  push:
+    branches: [validation/manifold-atomic-coverage-20261119]
+permissions:
+  contents: read
+concurrency:
+  group: validation-manifold-atomic-coverage-20261119
+  cancel-in-progress: true
+jobs:
+  coverage:
+    if: github.repository == 'Afloat16/aoci-code'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: baseline
+            source: 08723c1b9f72225d1b63037f8a95e48387661b14
+          - variant: candidate
+            source: 8e2a88f757fe6b2d096016642400086c4680f2d0
+    env:
+      CC: gcc-14
+      CXX: g++-14
+    steps:
+      - name: Check out exact validation harness
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          path: harness
+          persist-credentials: false
+      - name: Check out exact Manifold source
+        uses: actions/checkout@v7
+        with:
+          repository: Afloat16/manifold
+          ref: ${{ matrix.source }}
+          path: manifold
+          persist-credentials: false
+      - name: Install upstream coverage dependencies
+        uses: awalsh128/cache-apt-pkgs-action@v1
+        with:
+          packages: libgtest-dev git libtbb-dev pkg-config lcov cmake
+      - name: Reproduce full upstream coverage pipeline
+        working-directory: manifold
+        run: python3 ../harness/validation/manifold_coverage.py ${{ matrix.variant }} ${{ matrix.source }}
+      - name: Preserve full validation evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: manifold-coverage-${{ matrix.variant }}
+          path: coverage-evidence/
+          if-no-files-found: warn
+          retention-days: 14
