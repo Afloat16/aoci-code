@@ -1,0 +1,33 @@
+name: Build exact AOCI governance binary fda12baa
+on:
+  push:
+    branches: [validation/aoci-governance-fda12baa-20261120]
+permissions:
+  contents: read
+jobs:
+  build:
+    if: github.repository == 'Afloat16/aoci-code'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: aoci-spec/aoci-code
+          ref: fda12baa06d9f95ebb38d1029879cfd1c92d7bd1
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16
+        with:
+          go-version: '1.26.11'
+          cache: false
+      - name: Build official binary from exact source
+        run: |
+          test "$(git rev-parse HEAD)" = fda12baa06d9f95ebb38d1029879cfd1c92d7bd1
+          make build BUILD_BIN=build/aoci-governance
+          sha256sum build/aoci-governance
+          git diff --exit-code
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: aoci-governance-linux-amd64-fda12baa
+          path: build/aoci-governance
+          retention-days: 3
+          if-no-files-found: error
