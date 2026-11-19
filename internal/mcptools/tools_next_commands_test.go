@@ -1,11 +1,15 @@
 package mcptools
 
 import (
+	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/aoci-spec/aoci-code/internal/machinecontract"
 	"github.com/aoci-spec/aoci-code/internal/volumegovernance"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 // The commands must be runnable as returned: absolute quoted executable, the
@@ -40,7 +44,7 @@ func TestNextCommandsCarryTheSharedSpellings(t *testing.T) {
 		{Code: "observed_pending"}, // duplicates must not duplicate commands
 		{Code: "cognition_budget_exceeded"},
 	}
-	blocked := blockedNextCommands(root, facts)
+	blocked := blockedNextCommands(root, facts, nil)
 	joined := strings.Join(blocked, "\n")
 	if len(blocked) != 2 ||
 		strings.Contains(joined, machinecontract.RemediationCommandScopeAcknowledge) ||
@@ -52,7 +56,7 @@ func TestNextCommandsCarryTheSharedSpellings(t *testing.T) {
 	review := blockedNextCommands(root, &volumegovernance.Facts{
 		NextRequiredAction: machinecontract.ActionReviewObservedEvidence,
 		Findings:           []volumegovernance.Finding{{Code: "observed_pending"}, {Code: "observed_pending"}},
-	})
+	}, nil)
 	if len(review) != 3 || !strings.HasSuffix(review[0], machinecontract.RemediationCommandScopeStatus) ||
 		!strings.HasSuffix(review[1], machinecontract.RemediationCommandScopeAcknowledge) ||
 		!strings.HasSuffix(review[2], machinecontract.RemediationCommandAgentGuide) {
@@ -62,7 +66,7 @@ func TestNextCommandsCarryTheSharedSpellings(t *testing.T) {
 
 	scopeCommands := blockedNextCommands(root, &volumegovernance.Facts{Findings: []volumegovernance.Finding{
 		{Code: "scope_change_required"}, {Code: "scope_change_required"},
-	}})
+	}}, nil)
 	if len(scopeCommands) != 2 ||
 		!strings.HasSuffix(scopeCommands[0], " "+machinecontract.RemediationCommandScopeStatus) ||
 		!strings.HasSuffix(scopeCommands[1], " "+machinecontract.RemediationCommandScopeActivate) {
@@ -70,7 +74,7 @@ func TestNextCommandsCarryTheSharedSpellings(t *testing.T) {
 	}
 	bound(scopeCommands)
 
-	if commands := blockedNextCommands(root, &volumegovernance.Facts{}); commands != nil {
+	if commands := blockedNextCommands(root, &volumegovernance.Facts{}, nil); commands != nil {
 		t.Fatalf("no clearable blocker must yield no commands, got %v", commands)
 	}
 
@@ -86,7 +90,7 @@ func TestNextCommandsCarryTheSharedSpellings(t *testing.T) {
 	// A root the shell cannot be handed safely yields no command at all: an
 	// absent advisory beats one that would govern the wrong tree.
 	for _, unusable := range []string{"", "/tmp/one\ntwo"} {
-		if commands := blockedNextCommands(unusable, facts); commands != nil {
+		if commands := blockedNextCommands(unusable, facts, nil); commands != nil {
 			t.Fatalf("root %q must yield no commands, got %v", unusable, commands)
 		}
 		if commands := evidenceNextCommands(unusable); commands != nil {
@@ -128,5 +132,105 @@ func TestBlockedNextActionNamesTheActualBlocker(t *testing.T) {
 	}
 	if got := blockedNextAction(nil, nil); got != machinecontract.MaintainActionResolveBlocker {
 		t.Fatalf("no facts must still answer a non-orphan token, got %q", got)
+	}
+}
+
+// A Volume a merge left unlike its Baseline record is the blocker, whatever
+// authoring findings precede it, and its repair is one git command over the
+// formal assets the Root enables.
+func TestMergedVolumeStopNamesTheRestore(t *testing.T) {
+	root := t.TempDir()
+	facts := &volumegovernance.Facts{}
+	facts.Root.Path, facts.Meta.Path = "aoci.txt", "aoci.meta.txt"
+	facts.Code = volumegovernance.AssetState{Enabled: true, Path: "aoci.code.txt"}
+	facts.Database = volumegovernance.AssetState{Path: "aoci.database.txt"}
+	facts.Findings = []volumegovernance.Finding{
+		{Code: "code_missing", Target: "pkg/a.go"},
+		{Code: "code_volume_unbaselined", Target: "aoci.code.txt", Cause: volumegovernance.CauseVolumeChangedAfterBaseline},
+	}
+	if code, action := blockingFinding(facts, nil); code != "code_volume_unbaselined" || action != machinecontract.MaintainActionRestoreFormalAssets {
+		t.Fatalf("the merged Volume must be the named blocker: %s %s", code, action)
+	}
+	commands := blockedNextCommands(root, facts, nil)
+	if len(commands) != 1 || !strings.HasPrefix(commands[0], "git -C ") ||
+		!strings.Contains(commands[0], " "+machinecontract.RemediationGitRestoreFormalAssets+" ") ||
+		strings.Contains(commands[0], "aoci.database.txt") {
+		t.Fatalf("restore command wrong: %v", commands)
+	}
+	for _, asset := range []string{"aoci.txt", "aoci.meta.txt", "aoci.code.txt", ".aoci/baseline.json"} {
+		if !strings.Contains(commands[0], asset) {
+			t.Fatalf("the restore must name %s: %s", asset, commands[0])
+		}
+	}
+	// An enabled Database Volume is restored with the rest.
+	facts.Database.Enabled = true
+	if commands = blockedNextCommands(root, facts, nil); len(commands) != 1 || !strings.Contains(commands[0], "aoci.database.txt") {
+		t.Fatalf("an enabled Database Volume belongs to the set: %v", commands)
+	}
+	// A Volume Git hides needs scan, not a restore: nothing is offered.
+	facts.Findings[1].Cause = "hidden_from_git"
+	if code, action := blockingFinding(facts, nil); action != machinecontract.MaintainActionResolveBlocker || code != "code_missing" {
+		t.Fatalf("a hidden Volume is not the restore stop: %s %s", code, action)
+	}
+	if commands = blockedNextCommands(root, facts, nil); commands != nil {
+		t.Fatalf("no restore for a hidden Volume: %v", commands)
+	}
+}
+
+// The restore is offered only while it is the blocker the result names: a
+// pending Recovery comes first and must not sit beside a command that
+// overwrites the formal assets, while a Scope Change waits for the restore.
+func TestRestoreIsOfferedOnlyAsTheNamedBlocker(t *testing.T) {
+	root := t.TempDir()
+	merged := volumegovernance.Finding{Code: "code_volume_unbaselined", Target: "aoci.code.txt", Cause: volumegovernance.CauseVolumeChangedAfterBaseline}
+	build := func(extra string) *volumegovernance.Facts {
+		facts := &volumegovernance.Facts{}
+		facts.Root.Path, facts.Meta.Path = "aoci.txt", "aoci.meta.txt"
+		facts.Code = volumegovernance.AssetState{Enabled: true, Path: "aoci.code.txt"}
+		facts.Findings = []volumegovernance.Finding{{Code: extra, Cause: "entries"}, merged}
+		return facts
+	}
+	pending := build("recovery_pending")
+	if _, action := blockingFinding(pending, nil); action != machinecontract.MaintainActionClosePendingRecovery {
+		t.Fatalf("a pending Recovery comes first: %s", action)
+	}
+	if commands := strings.Join(blockedNextCommands(root, pending, nil), "\n"); strings.Contains(commands, "git ") {
+		t.Fatalf("no restore beside a pending Recovery: %s", commands)
+	}
+	// A Database orphan the result asks to remove first is named instead, and
+	// the command follows the action that was chosen.
+	orphaned := build("code_missing")
+	if _, action := blockingFinding(orphaned, []string{"database://local/main/gone"}); action != machinecontract.MaintainActionExplicitOrphanRemove {
+		t.Fatalf("a Database orphan comes first: %s", action)
+	}
+	if commands := strings.Join(blockedNextCommands(root, orphaned, []string{"database://local/main/gone"}), "\n"); strings.Contains(commands, "git ") {
+		t.Fatalf("no restore beside a Database orphan to remove: %s", commands)
+	}
+	for _, later := range []string{"scope_change_required", "cognition_budget_exceeded"} {
+		facts := build(later)
+		if _, action := blockingFinding(facts, nil); action != machinecontract.MaintainActionRestoreFormalAssets {
+			t.Fatalf("the restore comes before %s: %s", later, action)
+		}
+		if commands := blockedNextCommands(root, facts, nil); len(commands) == 0 || !strings.HasPrefix(commands[0], "git -C ") {
+			t.Fatalf("the restore command leads before %s: %v", later, commands)
+		}
+	}
+}
+
+// A Volumes v1 repository whose assets do not load is damaged, not Legacy:
+// Maintain answers the load failure and never the migration.
+func TestMaintainOnDamagedVolumesIsNotTheLegacyStop(t *testing.T) {
+	root := buildVolumeRepo(t, true, false)
+	session := connectMCPClient(t, root)
+	if err := os.Remove(filepath.Join(root, "aoci.meta.txt")); err != nil {
+		t.Fatal(err)
+	}
+	result, err := session.CallTool(context.Background(), &mcp.CallToolParams{Name: "aoci_maintain", Arguments: map[string]any{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := resText(t, result)
+	if !result.IsError || strings.Contains(text, machinecontract.StatusLegacyReadOnlyMigrateRequired) || strings.Contains(text, "migrate_legacy_repository") {
+		t.Fatalf("a damaged Volumes repository was answered as Legacy:\n%s", text)
 	}
 }
