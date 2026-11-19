@@ -43,7 +43,14 @@ type cognitionRefreshSession struct {
 	// so they may be submitted separately and in any order: when one half arrives and the other is already present it latches, exactly equivalent to
 	// submitting both in one call. A brand-new complete delivery (carrying neither field, no cursor) resets that
 	// body's evidence, so every delivery attempt still collects its own proof.
-	deliveryEvidence map[string]*overviewDeliveryEvidence
+	deliveryEvidence map[deliveryKey]*overviewDeliveryEvidence
+	// currentDeliveries holds the one current delivery of each Host session
+	// and requested scope: its body, its retained delivery, and how far this
+	// process has sent it. Transport progress, proofs, and retained cursors
+	// all answer to it (beginDelivery, advanceDelivery, deliveryServed).
+	// currentOrder is its eviction order, oldest first.
+	currentDeliveries map[deliveryScope]*currentDelivery
+	currentOrder      []deliveryScope
 	// compactionAttempt, capacity, chains, and chainOrder belong to the
 	// Host-capacity loop breaker and the delivery chain IDs the Ledger
 	// carries (overview_capacity.go).
@@ -79,7 +86,7 @@ func newCognitionRefreshSession() *cognitionRefreshSession {
 		pendingEvents:       map[string]bool{},
 		consumedEvents:      map[string]bool{},
 		governanceSnapshots: map[string]string{},
-		deliveryEvidence:    map[string]*overviewDeliveryEvidence{},
+		deliveryEvidence:    map[deliveryKey]*overviewDeliveryEvidence{},
 	}
 }
 
@@ -695,6 +702,7 @@ func (session *cognitionRefreshSession) pendingEventReceiptID() string {
 //
 // As with the other delivery-path methods in this file, the caller (the Overview handler) already holds session.mu.
 func (session *cognitionRefreshSession) mergeDeliveryEvidence(
+	owner volumeDeliveryOwner,
 	bodySHA256 string,
 	hostStatus string,
 	report *overviewModelAttestation,
@@ -703,12 +711,13 @@ func (session *cognitionRefreshSession) mergeDeliveryEvidence(
 		return hostStatus, report
 	}
 	if session.deliveryEvidence == nil {
-		session.deliveryEvidence = map[string]*overviewDeliveryEvidence{}
+		session.deliveryEvidence = map[deliveryKey]*overviewDeliveryEvidence{}
 	}
-	evidence := session.deliveryEvidence[bodySHA256]
+	key := deliveryKey{owner: owner, body: bodySHA256}
+	evidence := session.deliveryEvidence[key]
 	if evidence == nil {
 		evidence = &overviewDeliveryEvidence{}
-		session.deliveryEvidence[bodySHA256] = evidence
+		session.deliveryEvidence[key] = evidence
 	}
 	// The half this call explicitly carries always wins as the latest (a mismatching confirmation means the host now
 	// says "not fully received", overriding an earlier confirmation); memory only fills the half this call did not carry.
@@ -730,13 +739,167 @@ func (session *cognitionRefreshSession) mergeDeliveryEvidence(
 	return hostStatus, report
 }
 
-// resetDeliveryEvidence discards the old evidence of that body when a brand-new complete delivery starts:
-// every delivery attempt collects its own proof, and an old confirmation does not testify for a new transmission.
-func (session *cognitionRefreshSession) resetDeliveryEvidence(bodySHA256 string) {
+// deliveryCurrent reports whether the named retained delivery is the current
+// one of its Host session and scope. A request that names none (the plain
+// live path) answers for whatever is current.
+func (session *cognitionRefreshSession) deliveryCurrent(owner volumeDeliveryOwner, scope, delivery string) bool {
+	if session == nil || delivery == "" {
+		return true
+	}
+	current := session.currentDeliveries[deliveryScope{owner: owner, scope: scope}]
+	return current != nil && current.delivery == delivery
+}
+
+// pendingEvidence is what a rendered response would leave in the proof memory
+// of its body: the state of both halves after this call. It is written only
+// once the response is committed (commitEvidence), so a refused proof is
+// forgotten whole.
+type pendingEvidence struct {
+	session     *cognitionRefreshSession
+	key         deliveryKey
+	confirmed   bool
+	attestation *overviewModelAttestation
+}
+
+// peekDeliveryEvidence answers what mergeDeliveryEvidence would, and writes
+// nothing: the half this call carries wins, memory fills the other.
+func (session *cognitionRefreshSession) peekDeliveryEvidence(owner volumeDeliveryOwner, bodySHA256, hostStatus string, report *overviewModelAttestation) (string, *overviewModelAttestation) {
+	if session == nil || bodySHA256 == "" {
+		return hostStatus, report
+	}
+	evidence := session.deliveryEvidence[deliveryKey{owner: owner, body: bodySHA256}]
+	if evidence == nil {
+		return hostStatus, report
+	}
+	if hostStatus != hostDeliveryConfirmed && hostStatus != hostDeliveryIncomplete && evidence.confirmed {
+		hostStatus = hostDeliveryConfirmed
+	}
+	if report == nil {
+		report = evidence.attestation
+	}
+	return hostStatus, report
+}
+
+// commit writes a committed response's proof memory. The caller holds
+// the Host session's lock.
+func (pending *pendingEvidence) commit() {
+	if pending == nil || pending.session == nil || pending.key.body == "" {
+		return
+	}
+	if pending.session.deliveryEvidence == nil {
+		pending.session.deliveryEvidence = map[deliveryKey]*overviewDeliveryEvidence{}
+	}
+	pending.session.deliveryEvidence[pending.key] = &overviewDeliveryEvidence{confirmed: pending.confirmed, attestation: pending.attestation}
+}
+
+// deliveryKey names one body as one Host session received it. Two MCP sessions
+// of one server share the refresh session, and neither may ride the other's
+// transport or proof.
+type deliveryKey struct {
+	owner volumeDeliveryOwner
+	body  string
+}
+
+// deliveryScope names the one place a delivery can be current: a Host session
+// and the scope it asked for.
+type deliveryScope struct {
+	owner volumeDeliveryOwner
+	scope string
+}
+
+// currentDelivery is what this process is sending, or has sent, to one Host
+// session for one requested scope since that session's last fresh request
+// that was answered with a body: which body, through which retained delivery
+// (empty on the live path), and the highest Chunk sent in order.
+type currentDelivery struct {
+	body, delivery string
+	sent, count    int
+}
+
+// currentDeliveryMax bounds the memory. A scope evicted from it has no
+// current delivery, and nothing is sent that is not current.
+const currentDeliveryMax = 64
+
+// beginDelivery makes a fresh request's body the current delivery of its Host
+// session and scope, at the Chunk it just sent. Whatever was current there is
+// replaced, and the proof halves remembered for the replaced body go with it:
+// they vouched for a transmission that is no longer the one in progress. The
+// caller holds session.mu.
+func (session *cognitionRefreshSession) beginDelivery(owner volumeDeliveryOwner, scope, bodySHA256, delivery string, index, count int) {
+	if session == nil || bodySHA256 == "" {
+		return
+	}
+	if session.currentDeliveries == nil {
+		session.currentDeliveries = map[deliveryScope]*currentDelivery{}
+	}
+	key := deliveryScope{owner: owner, scope: scope}
+	if previous := session.currentDeliveries[key]; previous == nil {
+		session.currentOrder = append(session.currentOrder, key)
+	} else {
+		delete(session.deliveryEvidence, deliveryKey{owner: owner, body: previous.body})
+	}
+	delete(session.deliveryEvidence, deliveryKey{owner: owner, body: bodySHA256})
+	session.currentDeliveries[key] = &currentDelivery{body: bodySHA256, delivery: delivery, sent: index, count: count}
+	for len(session.currentOrder) > currentDeliveryMax {
+		delete(session.currentDeliveries, session.currentOrder[0])
+		session.currentOrder = session.currentOrder[1:]
+	}
+}
+
+// advanceDelivery records a continuation Chunk. It counts only for the
+// current delivery of that Host session and scope, the same body through the
+// same retained delivery, and only as the next Chunk in order: a cursor of a
+// superseded delivery, one still in flight when its successor began, a Chunk
+// out of order, and a body this process has no fresh request for all leave
+// the record as it is. The caller holds session.mu.
+func (session *cognitionRefreshSession) advanceDelivery(owner volumeDeliveryOwner, scope, bodySHA256, delivery string, index, count int) {
 	if session == nil {
 		return
 	}
-	delete(session.deliveryEvidence, bodySHA256)
+	current := session.currentDeliveries[deliveryScope{owner: owner, scope: scope}]
+	if current == nil || current.body != bodySHA256 || current.delivery != delivery || index != current.sent+1 {
+		return
+	}
+	current.sent, current.count = index, count
+}
+
+// commitTransport records a response that carried body bytes, once nothing
+// can refuse it any more: a fresh one becomes the current delivery of its
+// Host session and scope, a continuation advances it. A request that failed
+// after rendering never reaches this point, so it leaves the record, and the
+// proof memory beginDelivery drops, as they were. A proof response carries no
+// body and records no transport; its proof memory is committed beside this
+// call (pendingEvidence). delivery names the retained delivery the response
+// came through, empty on the live path. The caller holds session.mu.
+func (session *cognitionRefreshSession) commitTransport(owner volumeDeliveryOwner, scope, delivery string, input overviewIn, facts overviewDeliveryFacts) {
+	if session == nil || !facts.ChunkKnown {
+		return
+	}
+	if input.Cursor == "" {
+		session.beginDelivery(owner, scope, facts.BodySHA256, delivery, facts.ChunkIndex, facts.ChunkCount)
+		return
+	}
+	session.advanceDelivery(owner, scope, facts.BodySHA256, delivery, facts.ChunkIndex, facts.ChunkCount)
+}
+
+// deliveryServed reports whether that body is the current delivery of its
+// Host session and scope and this process has sent it to its end. A proof
+// that arrives through a retained delivery names it, and counts only while
+// that delivery is the current one: a delivery replaced while its proof was
+// on the way, even by one of the same bytes, proves nothing about its
+// successor. The live path names none and answers for whatever is current,
+// because its proof memory is the Host session's own, cleared when a
+// delivery begins. A nil session has no transport to remember and answers
+// true, as a caller without one always did.
+func (session *cognitionRefreshSession) deliveryServed(owner volumeDeliveryOwner, scope, bodySHA256, delivery string) bool {
+	if session == nil {
+		return true
+	}
+	current := session.currentDeliveries[deliveryScope{owner: owner, scope: scope}]
+	if current == nil || current.body != bodySHA256 || (delivery != "" && current.delivery != delivery) {
+		return false
+	}
+	return current.count > 0 && current.sent >= current.count
 }
 
 // recordAttestedDelivery consumes one complete, host-confirmed delivery
