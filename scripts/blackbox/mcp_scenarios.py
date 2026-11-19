@@ -2151,6 +2151,78 @@ def group_n():
     else:
         record(g, "N4c.guide-command-runs-from-another-directory", "FAIL", f"rc={rc_g} guide={gcmd}"[:200])
 
+    # N5: two branches each maintained the index, and the merge conflicts in
+    # the Baseline and the Code Volume. Taking one side's Baseline alone leaves
+    # the Volume unlike its record. The blocked Maintain names that stop and
+    # returns the one command that restores the formal assets together from the
+    # commit the Host names; after it, Maintain reissues what the other side
+    # changed and the repository aligns.
+    fx = make_fixture("fx-merge", 4)
+    sm = Session(fx)
+    for _ in range(4):
+        m, _, _ = maintain(sm)
+        if not (m.get("candidates") or []): break
+        submit_batch(sm, m)
+    sm.close()
+    sh(fx, "git", "add", "-A"); sh(fx, "git", "commit", "-q", "-m", "index")
+    trunk = sh(fx, "git", "rev-parse", "--abbrev-ref", "HEAD").strip()
+    sh(fx, "git", "checkout", "-q", "-b", "side-a")
+    land_write(fx, "f001.go", "Provides side A unit 1")
+    sh(fx, "git", "add", "-A"); sh(fx, "git", "commit", "-q", "-m", "side a")
+    sh(fx, "git", "checkout", "-q", trunk); sh(fx, "git", "checkout", "-q", "-b", "side-b")
+    land_write(fx, "f002.go", "Provides side B unit 2")
+    sb = Session(fx); add_source_and_align(sb, fx, "f010.go"); sb.close()
+    sh(fx, "git", "add", "-A"); sh(fx, "git", "commit", "-q", "-m", "side b")
+    sh(fx, "git", "checkout", "-q", "side-a")
+    # A batch issued before the merge is submitted after it, further down.
+    with open(os.path.join(fx, "pkg", "f003.go"), "a") as f:
+        f.write("\n// changed before the merge\n")
+    sm = Session(fx)
+    issued, _, _ = maintain(sm)
+    sm.close()
+    sh(fx, "git", "add", "-A"); sh(fx, "git", "commit", "-q", "-m", "side a source")
+    merged = subprocess.run(["git", "merge", "side-b"], cwd=fx, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120)
+    sh(fx, "git", "checkout", "--theirs", "--", ".aoci/baseline.json")
+    sm = Session(fx)
+    m, t, _ = maintain(sm)
+    cmds = m.get("next_commands") or []
+    restore = next((c for c in cmds if c.startswith("git -C ") and " checkout {commit} -- " in c), "")
+    named = (merged.returncode != 0 and m.get("status") == "stopped" and not (m.get("candidates") or [])
+             and m.get("next_action") == "restore_formal_assets_from_one_commit"
+             and all(asset in restore for asset in ("aoci.txt", "aoci.meta.txt", "aoci.code.txt", ".aoci/baseline.json"))
+             and "aoci.database.txt" not in restore)
+    # The Guide names the same stop, with the command bound to this root, and
+    # a pending Scope Change does not hide it: activation would refuse over
+    # the drifted bytes, so the restore still comes first.
+    _, guide, _, _ = cli(fx, "index", "agent", "guide", "--agent", "codex")
+    stop = guide.get("stop") or {}
+    named = named and stop.get("rule_code") == "code_volume_unbaselined" and (stop.get("safe_next_action") or "").startswith(restore)
+    cli(fx, "config", "set", "sensitive_name_rules", "v1")
+    mp, _, _ = maintain(sm)
+    codes = [f.get("code") for f in ((mp.get("governance") or {}).get("findings") or [])]
+    named = (named and "scope_change_required" in codes and mp.get("next_action") == "restore_formal_assets_from_one_commit"
+             and (mp.get("next_commands") or [""])[0] == restore)
+    cli(fx, "config", "set", "sensitive_name_rules", "v2")
+    stale, ts, _ = submit_batch(sm, issued)
+    named = (named and stale.get("status") == "stopped" and stale.get("formal_writes_started") is False
+             and stale.get("next_action") == "restore_formal_assets_from_one_commit"
+             and (stale.get("next_commands") or [""])[0] == restore)
+    record(g, "N5.merge-stop-names-the-restore", "PASS" if named else "FAIL",
+           f"merge_rc={merged.returncode} next={m.get('next_action')} stop={stop.get('rule_code')} scope={mp.get('next_action')} {codes} cmds={cmds}"[:300])
+    if named:
+        proc = subprocess.run(restore.replace("{commit}", "MERGE_HEAD"), shell=True, cwd=os.path.join(WORK, "elsewhere"),
+                              capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120)
+        m2, _, _ = maintain(sm)
+        reissued = sorted(c["path"] for c in (m2.get("candidates") or []))
+        a, tw, _ = submit_batch(sm, m2)
+        al, _ = fixture_aligned(fx)
+        ok = proc.returncode == 0 and reissued == ["pkg/f001.go", "pkg/f003.go"] and a.get("aligned") is True and al
+        record(g, "N5b.restored-set-reissues-the-other-side", "PASS" if ok else "FAIL",
+               f"rc={proc.returncode} reissued={reissued} aligned={a.get('aligned')} {proc.stderr[:100]}"[:240])
+    else:
+        record(g, "N5b.restored-set-reissues-the-other-side", "FAIL", "no restore command to run")
+    sm.close()
+
 def group_t():
     """A TTY confirmation must be readable before the operator has to answer it.
 
