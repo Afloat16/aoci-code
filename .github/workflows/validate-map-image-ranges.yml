@@ -1,0 +1,124 @@
+name: Validate mAP image range reuse
+on:
+  push:
+    branches: [validation/map-image-ranges-20261119]
+permissions:
+  contents: read
+concurrency:
+  group: validation-map-image-ranges-20261119
+  cancel-in-progress: true
+jobs:
+  quality:
+    if: github.repository == 'Afloat16/aoci-code'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      UV_NO_SYNC: "1"
+      MKL_NUM_THREADS: "1"
+      OMP_NUM_THREADS: "1"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: Afloat16/kornia
+          ref: 8f1fa7740f3ddf4c53e9a65eb6e75ffee8859ebb
+          fetch-depth: 2
+          persist-credentials: false
+      - uses: prefix-dev/setup-pixi@v0.11.3
+        with:
+          pixi-version: v0.40.0
+          cache: false
+      - name: Locked environment and exact source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 8f1fa7740f3ddf4c53e9a65eb6e75ffee8859ebb
+          mkdir -p validation-results
+          pixi run -e py312 install
+          .venv-py312/bin/python -c 'import sys, torch, kornia; from pathlib import Path; print(sys.executable, sys.version, torch.__version__, kornia.__file__); assert Path(kornia.__file__).resolve() == Path("kornia/__init__.py").resolve()' | tee validation-results/environment.log
+          git diff --check
+      - name: Complete metrics and half-precision mAP regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          pixi run -e py312 test-module tests/metrics/ --device=cpu --dtype=float32,float64 --timeout=600 -q -ra --junitxml=validation-results/metrics.xml 2>&1 | tee validation-results/metrics.log
+          pixi run -e py312 test-module tests/metrics/test_map.py --device=cpu --dtype=float16,bfloat16 --timeout=600 -q -ra --junitxml=validation-results/map-half.xml 2>&1 | tee validation-results/map-half.log
+      - name: Full hooks, types, release notes and promised packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          pixi run -e py312 pre-commit-all 2>&1 | tee validation-results/pre-commit.log
+          pixi run -e py312 typecheck 2>&1 | tee validation-results/typecheck.log
+          pixi run -e py312 changelog-preview > validation-results/changelog-preview.log 2>&1
+          git diff 7ecfbb392285e03f73b4dd4cce62fc3fb8349c33 HEAD --name-only --no-renames > validation-results/changed-paths.txt
+          for kind in compile onnx; do
+            packages=$(.venv-py312/bin/python .github/scripts/conformance_packages.py "$kind" < validation-results/changed-paths.txt)
+            printf '%s\n' "$packages" > "validation-results/$kind-packages.txt"
+            if [ -z "$packages" ]; then
+              printf '%s: no affected promised stable-core operator\n' "$kind" > "validation-results/$kind.log"
+              continue
+            fi
+            if [ "$kind" = compile ]; then test_file=tests/test_inductor_conformance.py; else test_file=tests/onnx/test_conformance.py; fi
+            pixi run -e py312 test-module "$test_file" "--$kind-conformance=$packages" --device=cpu --dtype=float64 --timeout=600 -q -ra "--junitxml=validation-results/$kind.xml" 2>&1 | tee "validation-results/$kind.log"
+          done
+          git diff --exit-code
+      - name: Minimum supported Torch mAP
+        shell: bash
+        run: |
+          set -euo pipefail
+          pixi run -e py312 uv run --no-sync uv pip install --reinstall-package torch --index-url https://download.pytorch.org/whl/cpu torch==2.5.1
+          pixi run -e py312 uv run --no-sync uv pip uninstall triton
+          .venv-py312/bin/python .github/scripts/check_torch_env.py --channel pinned --expected 2.5.1 | tee validation-results/minimum-environment.log
+          pixi run -e py312 test-module tests/metrics/test_map.py --device=cpu --dtype=float32,float64 --timeout=600 -q -ra --junitxml=validation-results/minimum-map.xml 2>&1 | tee validation-results/minimum-map.log
+          pixi run -e py312 test-module tests/metrics/test_map.py --device=cpu --dtype=float16,bfloat16 --timeout=600 -q -ra --junitxml=validation-results/minimum-map-half.xml 2>&1 | tee validation-results/minimum-map-half.log
+          git diff --exit-code
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: map-image-ranges-quality-8f1fa77
+          path: validation-results/
+          retention-days: 14
+  comparison:
+    if: github.repository == 'Afloat16/aoci-code'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      UV_NO_SYNC: "1"
+      MKL_NUM_THREADS: "1"
+      OMP_NUM_THREADS: "1"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: Afloat16/kornia
+          ref: 8f1fa7740f3ddf4c53e9a65eb6e75ffee8859ebb
+          fetch-depth: 2
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          path: validation-harness
+          persist-credentials: false
+          sparse-checkout: validation
+      - uses: prefix-dev/setup-pixi@v0.11.3
+        with:
+          pixi-version: v0.40.0
+          cache: false
+      - name: Prepare both exact source trees
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 8f1fa7740f3ddf4c53e9a65eb6e75ffee8859ebb
+          mkdir -p validation-results
+          git worktree add --detach baseline-source 7ecfbb392285e03f73b4dd4cce62fc3fb8349c33
+          pixi run -e py312 install
+      - name: Exact public API equivalence, alternating timing and raw allocations
+        shell: bash
+        run: |
+          set -euo pipefail
+          .venv-py312/bin/python -u - < validation-harness/validation/compare_map.py 2>&1 | tee validation-results/comparison.log
+          git diff --exit-code
+          git -C baseline-source diff --exit-code
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: map-image-ranges-comparison-8f1fa77
+          path: validation-results/
+          retention-days: 14
