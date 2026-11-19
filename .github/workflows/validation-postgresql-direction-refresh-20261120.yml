@@ -1,0 +1,99 @@
+name: Validate PostgreSQL direction refresh
+on:
+  push:
+    branches: [validation/postgresql-direction-refresh-20261120]
+permissions:
+  contents: read
+jobs:
+  fast:
+    if: github.repository == 'Afloat16/aoci-code'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: Afloat16/aoci-code
+          ref: 3991e70dae7d2d5ca3614720b21151e5602ba067
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version: '1.26.11'
+          cache: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version: '22'
+      - name: Verify exact source and PostgreSQL regressions
+        run: |
+          test "$(git rev-parse HEAD)" = 3991e70dae7d2d5ca3614720b21151e5602ba067
+          go test -v -count=1 ./internal/dbevidence -run 'TestPostgreSQL'
+      - name: Required fast gate
+        run: make fast
+      - name: Formal index quality on committed source
+        run: |
+          make build
+          bash scripts/check-index-quality.sh build/aoci
+          git diff --exit-code
+  verify:
+    if: github.repository == 'Afloat16/aoci-code'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: Afloat16/aoci-code
+          ref: 3991e70dae7d2d5ca3614720b21151e5602ba067
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version: '1.26.11'
+          cache: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version: '22'
+      - name: Install pinned verification tools
+        run: |
+          go install honnef.co/go/tools/cmd/staticcheck@v0.7.0
+          go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
+          go install github.com/google/go-licenses@v1.6.0
+      - name: Required end-to-end closure
+        run: |
+          test "$(git rev-parse HEAD)" = 3991e70dae7d2d5ca3614720b21151e5602ba067
+          make verify
+      - name: Committed source remains unchanged
+        if: always()
+        run: git diff --exit-code
+  postgresql:
+    if: github.repository == 'Afloat16/aoci-code'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: Afloat16/aoci-code
+          ref: 3991e70dae7d2d5ca3614720b21151e5602ba067
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version: '1.26.11'
+          cache: false
+      - name: Start disposable PostgreSQL 18
+        run: |
+          validation_password="$(openssl rand -hex 20)"
+          echo "::add-mask::$validation_password"
+          echo "AOCI_TEST_POSTGRES_ADMIN_PASSWORD=$validation_password" >> "$GITHUB_ENV"
+          echo 'AOCI_TEST_POSTGRES_ADMIN_USER=postgres' >> "$GITHUB_ENV"
+          echo 'AOCI_TEST_POSTGRES_ADMIN_DATABASE=postgres' >> "$GITHUB_ENV"
+          docker run -d --name aoci-direction-pg -p 127.0.0.1::5432 -e POSTGRES_PASSWORD="$validation_password" postgres:18 >/dev/null
+          validation_port="$(docker port aoci-direction-pg 5432/tcp | head -n1 | sed 's/.*://')"
+          test -n "$validation_port"
+          echo "AOCI_TEST_POSTGRES_ADMIN_ADDR=127.0.0.1:$validation_port" >> "$GITHUB_ENV"
+          for validation_attempt in $(seq 1 30); do docker exec aoci-direction-pg pg_isready -U postgres >/dev/null 2>&1 && break; sleep 1; done
+          docker exec aoci-direction-pg pg_isready -U postgres >/dev/null
+      - name: PostgreSQL real catalog regressions
+        run: |
+          test "$(git rev-parse HEAD)" = 3991e70dae7d2d5ca3614720b21151e5602ba067
+          go test -v -tags=integration -count=1 -run TestPostgreSQL ./internal/dbevidence
+          git diff --exit-code
+      - name: Stop disposable PostgreSQL
+        if: always()
+        run: docker rm -f aoci-direction-pg >/dev/null 2>&1 || true
