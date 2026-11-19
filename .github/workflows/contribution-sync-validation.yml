@@ -1,0 +1,66 @@
+name: sync-190-main-3b43-validation
+
+on:
+  push:
+    branches: [validation/sync-190-main-3b43-20261119]
+
+permissions:
+  contents: read
+
+jobs:
+  fast:
+    if: github.repository == 'Afloat16/aoci-code'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: 8f8631957d92dd5ea297739664a6e6526224d44d
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version-file: go.mod
+          cache: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version: 22
+      - name: Verify exact source identity
+        run: test "$(git rev-parse HEAD)" = 8f8631957d92dd5ea297739664a6e6526224d44d
+      - name: Run ordinary contribution gate
+        run: make fast
+      - name: Check source bytes
+        if: always()
+        run: git diff --exit-code
+
+  verify:
+    if: github.repository == 'Afloat16/aoci-code'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: 8f8631957d92dd5ea297739664a6e6526224d44d
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version-file: go.mod
+          cache: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version: 22
+      - name: Verify exact source identity
+        run: test "$(git rev-parse HEAD)" = 8f8631957d92dd5ea297739664a6e6526224d44d
+      - name: Install the repository's pinned analysis tools
+        run: |
+          go install honnef.co/go/tools/cmd/staticcheck@v0.7.0
+          go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
+          go install github.com/google/go-licenses@v1.6.0
+      - name: Run complete deterministic closure
+        run: make verify
+      - name: Check aligned index
+        if: always()
+        run: bash scripts/check-index-quality.sh build/aoci
+      - name: Check source bytes
+        if: always()
+        run: git diff --exit-code
+
