@@ -1,0 +1,313 @@
+name: Validate property replacement snapshots
+on:
+  push:
+    branches: [validation/property-snapshots-20261120]
+permissions:
+  contents: read
+concurrency:
+  group: validation-property-snapshots-20261120
+  cancel-in-progress: true
+jobs:
+  format:
+    if: github.repository == 'Afloat16/aoci-code'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: Afloat16/manifold
+          ref: 847a82925fb9f1dc260fb483bc7427d4f15d8133
+          persist-credentials: false
+      - run: |
+          python3 -m venv .format-env
+          .format-env/bin/pip install clang-format==20.1.8
+          .format-env/bin/clang-format -i src/manifold.cpp src/properties.cpp test/properties_test.cpp
+          git diff --exit-code
+  native:
+    if: github.repository == 'Afloat16/aoci-code'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CC: gcc-14
+      CXX: g++-14
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: Afloat16/manifold
+          ref: 847a82925fb9f1dc260fb483bc7427d4f15d8133
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Prepare pinned sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 847a82925fb9f1dc260fb483bc7427d4f15d8133
+          python3 -m venv .validation-env
+          .validation-env/bin/python -m pip install cmake==4.4.5 ninja==1.13.0
+          echo "$GITHUB_WORKSPACE/.validation-env/bin" >> "$GITHUB_PATH"
+          mkdir -p validation-results
+          "$CXX" --version > validation-results/compiler.txt
+          git diff --check
+          git worktree add --detach ../property-base 08723c1b9f72225d1b63037f8a95e48387661b14
+      - name: Build baseline and candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S ../property-base -B build-base -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DMANIFOLD_TEST=ON -DMANIFOLD_PAR=OFF -DMANIFOLD_CBIND=ON -DMANIFOLD_PYBIND=OFF -DMANIFOLD_DEBUG=ON -DMANIFOLD_ASSERT=ON -DMANIFOLD_STRICT=ON 2>&1 | tee validation-results/base-configure.log
+          cmake --build build-base --parallel 2 2>&1 | tee validation-results/base-build.log
+          cmake -S . -B build-fixed -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DMANIFOLD_TEST=ON -DMANIFOLD_PAR=OFF -DMANIFOLD_CBIND=ON -DMANIFOLD_PYBIND=OFF -DMANIFOLD_DEBUG=ON -DMANIFOLD_ASSERT=ON -DMANIFOLD_STRICT=ON 2>&1 | tee validation-results/fixed-configure.log
+          cmake --build build-fixed --parallel 2 2>&1 | tee validation-results/fixed-build.log
+      - name: Check property compatibility on the baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          LD_LIBRARY_PATH="$GITHUB_WORKSPACE/build-base/src" ldd build-fixed/test/manifold_test > validation-results/baseline-test-loader.txt
+          LD_LIBRARY_PATH="$GITHUB_WORKSPACE/build-base/src" build-fixed/test/manifold_test --gtest_filter='Properties.*' --gtest_output=xml:validation-results/base-extended.xml 2>&1 | tee validation-results/base-extended.log
+      - name: Prepare public API and allocation probes
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > validation-results/alloc-trace.cpp <<'CPP'
+          #include <stddef.h>
+          #include <stdint.h>
+          extern "C" void* __libc_malloc(size_t);
+          extern "C" void* __libc_calloc(size_t, size_t);
+          extern "C" void* __libc_realloc(void*, size_t);
+          static thread_local bool enabled = false;
+          static thread_local size_t bytes = 0, calls = 0, matches = 0, target = 0;
+          static void Record(void* p, size_t n) {
+            if (p && enabled) { bytes += n; ++calls; if (n == target) ++matches; }
+          }
+          extern "C" void probe_begin(size_t expected) {
+            bytes = calls = matches = 0; target = expected; enabled = true;
+          }
+          extern "C" void probe_end(size_t* result) {
+            enabled = false; result[0] = bytes; result[1] = calls; result[2] = matches;
+          }
+          extern "C" void* malloc(size_t n) {
+            void* p = __libc_malloc(n); Record(p, n); return p;
+          }
+          extern "C" void* calloc(size_t count, size_t n) {
+            void* p = __libc_calloc(count, n);
+            if (n == 0 || count <= SIZE_MAX / n) Record(p, count * n);
+            return p;
+          }
+          extern "C" void* realloc(void* old, size_t n) {
+            void* p = __libc_realloc(old, n); Record(p, n); return p;
+          }
+          CPP
+          cat > validation-results/probe.cpp <<'CPP'
+          #include <algorithm>
+          #include <array>
+          #include <chrono>
+          #include <cmath>
+          #include <cstdio>
+          #include <cstring>
+          #include <dlfcn.h>
+          #include <stdexcept>
+          #include <string>
+          #include <vector>
+          #include "manifold/manifold.h"
+          using namespace manifold;
+          template <typename T> void Write(FILE* out, const T& value) {
+            if (std::fwrite(&value, sizeof(T), 1, out) != 1) throw std::runtime_error("write");
+          }
+          template <typename T> void Write(FILE* out, const std::vector<T>& values) {
+            Write(out, values.size());
+            if (!values.empty() && std::fwrite(values.data(), sizeof(T), values.size(), out) != values.size())
+              throw std::runtime_error("vector write");
+          }
+          void WriteMesh(const std::string& path, const MeshGL64& mesh) {
+            FILE* out = std::fopen(path.c_str(), "wb");
+            if (!out) throw std::runtime_error("open");
+            Write(out, mesh.numProp);
+            Write(out, mesh.vertProperties); Write(out, mesh.triVerts);
+            Write(out, mesh.mergeFromVert); Write(out, mesh.mergeToVert);
+            Write(out, mesh.runIndex); Write(out, mesh.runOriginalID);
+            Write(out, mesh.runTransform); Write(out, mesh.runFlags);
+            Write(out, mesh.faceID); Write(out, mesh.halfedgeTangent);
+            if (std::fclose(out)) throw std::runtime_error("close");
+          }
+          Manifold Properties(const Manifold& input, int count) {
+            return input.SetProperties(count, [count](double* props, vec3 p, const double*) {
+              for (int i = 0; i < count; ++i) props[i] = i + p[i % 3] / 8;
+            });
+          }
+          struct Case {
+            const char* name; Manifold solid; int op, output, calls;
+            Manifold Run() const {
+              const int old = solid.NumProp();
+              if (op == 1) return solid.SetProperties(output, nullptr);
+              if (op == 2) return solid.CalculateCurvature(old, old + 1);
+              if (op == 3) return solid.CalculateCurvature(0, 1);
+              if (op == 4) return solid.CalculateCurvature(-1, -1);
+              return solid.SetProperties(output, [old, count=output](double* props, vec3 p, const double* previous) {
+                for (int i = 0; i < count; ++i) props[i] = i < old ? previous[i] + 0.25 : i + p[i % 3];
+              });
+            }
+          };
+          int main(int argc, char** argv) {
+            if (argc != 2) return 1;
+            auto begin = reinterpret_cast<void(*)(size_t)>(dlsym(RTLD_DEFAULT, "probe_begin"));
+            auto end = reinterpret_cast<void(*)(size_t*)>(dlsym(RTLD_DEFAULT, "probe_end"));
+            if (!begin || !end) return 2;
+            const Manifold sphere8 = Properties(Manifold::Sphere(1, 256), 8);
+            const Manifold sphere32 = Properties(Manifold::Sphere(1, 512), 32);
+            MeshGL64 seamMesh = Manifold::Cube().CalculateNormals(0, 0).GetMeshGL64();
+            seamMesh.runFlags.assign(seamMesh.runFlags.size(), 0);
+            const Manifold seams = Properties(Manifold(seamMesh), 8);
+            const std::vector<Case> cases = {
+              {"empty_set", Manifold(), 0, 8, 100},
+              {"no_properties_set", Manifold::Sphere(1, 64), 0, 3, 20},
+              {"sphere8_replace", sphere8, 0, 8, 5},
+              {"sphere32_replace", sphere32, 0, 32, 2},
+              {"sphere32_shrink", sphere32, 0, 8, 2},
+              {"sphere32_expand", sphere32, 0, 48, 2},
+              {"sphere32_remove", sphere32, 1, 0, 5},
+              {"sphere32_zero", sphere32, 1, 32, 5},
+              {"sphere8_curvature_overwrite", sphere8, 3, 0, 5},
+              {"sphere32_curvature_expand", sphere32, 2, 0, 2},
+              {"seams_curvature_expand", seams, 2, 0, 100},
+              {"curvature_noop", sphere32, 4, 0, 5}
+            };
+            for (const auto& example : cases) {
+              if (example.solid.Status() != Manifold::Error::NoError) return 3;
+              const MeshGL64 before = example.solid.GetMeshGL64();
+              const size_t payload = example.solid.NumProp() * example.solid.NumPropVert() * sizeof(double);
+              const size_t expected = example.op == 4 ? 0 : payload;
+              for (int i = 0; i < 3; ++i)
+                if (example.Run().Status() != Manifold::Error::NoError) return 4;
+              std::array<std::array<size_t, 3>, 3> allocation;
+              for (auto& sample : allocation) {
+                begin(payload);
+                const Manifold result = example.Run();
+                const bool good = result.Status() == Manifold::Error::NoError;
+                end(sample.data());
+                if (!good) return 5;
+              }
+              std::vector<double> times;
+              size_t observed = 0;
+              for (int sample = 0; sample < 7; ++sample) {
+                const auto start = std::chrono::steady_clock::now();
+                for (int repeat = 0; repeat < example.calls; ++repeat) {
+                  const Manifold result = example.Run();
+                  observed += result.NumTri();
+                }
+                const auto stop = std::chrono::steady_clock::now();
+                times.push_back(std::chrono::duration<double, std::micro>(stop - start).count() / example.calls);
+              }
+              if (observed != example.solid.NumTri() * 7 * example.calls) return 6;
+              const MeshGL64 after = example.solid.GetMeshGL64();
+              if (before.vertProperties != after.vertProperties || before.triVerts != after.triVerts ||
+                  before.mergeFromVert != after.mergeFromVert || before.mergeToVert != after.mergeToVert ||
+                  before.runIndex != after.runIndex || before.runOriginalID != after.runOriginalID ||
+                  before.runTransform != after.runTransform || before.runFlags != after.runFlags ||
+                  before.faceID != after.faceID || before.halfedgeTangent != after.halfedgeTangent)
+                return 7;
+              const MeshGL64 output = example.Run().GetMeshGL64();
+              WriteMesh(std::string(argv[1]) + "/" + example.name + ".bin", output);
+              std::printf("%s %zu %zu %zu %zu %zu", example.name, example.solid.NumProp(),
+                          example.solid.NumPropVert(), example.solid.NumTri(), size_t(output.numProp), expected);
+              for (const auto& sample : allocation) for (const auto value : sample) std::printf(" %zu", value);
+              for (double time : times) std::printf(" %.6f", time);
+              std::printf("\n"); std::fflush(stdout);
+            }
+          }
+          CPP
+          cat > validation-results/benchmark.py <<'PY'
+          import hashlib
+          import json
+          import os
+          import platform
+          import shutil
+          import statistics
+          import subprocess
+          from pathlib import Path
+          root = Path("validation-results").resolve()
+          cpu = min(os.sched_getaffinity(0))
+          os.sched_setaffinity(0, {cpu})
+          records = {}
+          reference = root / "reference-meshes"
+          reference.mkdir()
+          for pair in range(5):
+              for label in (("base", "fixed") if pair % 2 == 0 else ("fixed", "base")):
+                  env = os.environ.copy()
+                  env["LD_LIBRARY_PATH"] = str(Path("build-" + label + "/src").resolve())
+                  env["LD_PRELOAD"] = str(root / "liballoc-trace.so")
+                  directory = root / f"meshes-{label}-{pair}"
+                  directory.mkdir()
+                  (root / f"{label}-loader.txt").write_text(subprocess.check_output(["ldd", str(root / "probe")], env=env, text=True))
+                  run = subprocess.run([str(root / "probe"), str(directory)], env=env, text=True, capture_output=True, check=True)
+                  (root / f"{label}-{pair}.txt").write_text(run.stdout)
+                  (root / f"{label}-{pair}.stderr").write_text(run.stderr)
+                  rows = {}
+                  for line in run.stdout.splitlines():
+                      f = line.split()
+                      name = f[0]
+                      row = {"input_channels": int(f[1]), "property_vertices": int(f[2]),
+                             "triangles": int(f[3]), "output_stride": int(f[4]), "expected_saved_bytes": int(f[5]),
+                             "allocation_samples": [list(map(int, f[i:i+3])) for i in (6, 9, 12)],
+                             "times_us": list(map(float, f[15:]))}
+                      assert len(row["times_us"]) == 7, f
+                      assert row["allocation_samples"].count(row["allocation_samples"][0]) == 3, (label, name, row)
+                      path = directory / f"{name}.bin"
+                      value = path.read_bytes()
+                      row["mesh_sha256"] = hashlib.sha256(value).hexdigest()
+                      if label == "base" and pair == 0:
+                          shutil.copyfile(path, reference / path.name)
+                      else:
+                          assert value == (reference / path.name).read_bytes(), (label, pair, name)
+                      rows[name] = row
+                  assert len(rows) == 12, rows
+                  records[(label, pair)] = rows
+                  shutil.rmtree(directory)
+                  print(label, pair, "complete", flush=True)
+          summary = []
+          for name, baseline in records[("base", 0)].items():
+              result = {key: baseline[key] for key in ("input_channels", "property_vertices", "triangles", "output_stride", "expected_saved_bytes", "mesh_sha256")}
+              result["name"] = name
+              for label in ("base", "fixed"):
+                  rows = [records[(label, pair)][name] for pair in range(5)]
+                  result[label + "_pairs"] = rows
+                  result[label + "_bytes"] = rows[0]["allocation_samples"][0][0]
+                  result[label + "_allocation_count"] = rows[0]["allocation_samples"][0][1]
+                  assert all(row["allocation_samples"][0] == rows[0]["allocation_samples"][0] for row in rows)
+                  result[label + "_median_us"] = statistics.median(statistics.median(row["times_us"]) for row in rows)
+              actual_saved = result["base_bytes"] - result["fixed_bytes"]
+              assert actual_saved == result["expected_saved_bytes"], (name, result)
+              assert result["base_allocation_count"] - result["fixed_allocation_count"] == int(actual_saved > 0), (name, result)
+              result["allocation_change_percent"] = 100 * (result["fixed_bytes"] / result["base_bytes"] - 1)
+              result["time_change_percent"] = 100 * (result["fixed_median_us"] / result["base_median_us"] - 1)
+              summary.append(result)
+          report = {"base": "08723c1b9f72225d1b63037f8a95e48387661b14", "candidate": "847a82925fb9f1dc260fb483bc7427d4f15d8133",
+                    "platform": platform.platform(), "affinity_cpu": cpu,
+                    "allocation_scope": "requested bytes from malloc/calloc/realloc during one public call; not peak live memory or RSS",
+                    "results": summary}
+          (root / "summary.json").write_text(json.dumps(report, indent=2) + "\n")
+          shutil.rmtree(reference)
+          for row in summary:
+              print(row["name"], row["base_bytes"], row["fixed_bytes"], row["allocation_change_percent"],
+                    row["base_median_us"], row["fixed_median_us"], row["time_change_percent"])
+          PY
+          "$CXX" -std=c++17 -O2 -shared -fPIC validation-results/alloc-trace.cpp -o validation-results/liballoc-trace.so
+          "$CXX" -std=c++17 -O3 validation-results/probe.cpp -Iinclude -Ibuild-fixed/include -Lbuild-fixed/src -Wl,-rpath,"$GITHUB_WORKSPACE/build-fixed/src" -lmanifold -ldl -o validation-results/probe
+      - name: Compare exact outputs and allocation measurements
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 validation-results/benchmark.py | tee validation-results/benchmark.log
+          sha256sum ../property-base/src/manifold.cpp src/manifold.cpp ../property-base/src/properties.cpp src/properties.cpp > validation-results/source-hashes.txt
+      - name: Run full native suite on exact candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          ctest --test-dir build-fixed --output-on-failure --parallel 2 --output-junit "$GITHUB_WORKSPACE/validation-results/full-native.xml" 2>&1 | tee validation-results/full-native.log
+          git diff --exit-code
+      - name: Save validation evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: property-snapshots-847a829
+          path: validation-results/
+          if-no-files-found: warn
+          retention-days: 14
